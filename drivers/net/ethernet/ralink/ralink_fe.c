@@ -4,10 +4,14 @@
  * Copyright (c) 2026 Richard van Schagen <richard@routerwrt.org>
  */
 
+#include <linux/clk.h>
 #include <linux/etherdevice.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
+#include <linux/reset.h>
 
 #include "ralink_fe.h"
 
@@ -36,6 +40,104 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_start_xmit		= ralink_fe_start_xmit,
 };
 
+static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
+{
+	u32 v;
+
+	if (priv->sdm) {
+		v = SDM_PDMA_FC | SDM_PORT_MAP | SDM_TCI_81XX |
+		    FIELD_PREP(SDM_EXT_VLAN, 0x8100);
+		v &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
+		regmap_write(priv->sdm, SDM_CON, v);
+	}
+}
+
+static int ralink_fe_hw_init(struct platform_device *pdev,
+			     struct ralink_fe_priv *priv)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *sdm_np;
+	int err;
+
+	priv->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(priv->base))
+		return dev_err_probe(dev, PTR_ERR(priv->base),
+				     "failed to map registers");
+
+	priv->irq = platform_get_irq(pdev, 0);
+	if (priv->irq < 0)
+		return dev_err_probe(dev, priv->irq, "missing IRQ");
+
+	priv->clk = devm_clk_get_optional(dev, "fe");
+	if (IS_ERR(priv->clk))
+		return dev_err_probe(dev, PTR_ERR(priv->clk),
+				     "failed to get fe clock");
+
+	err = clk_prepare_enable(priv->clk);
+	if (err)
+		return dev_err_probe(dev, err,
+				     "failed to enable fe clock");
+
+	priv->rst_fe = devm_reset_control_get_optional_exclusive(dev, "fe");
+	if (IS_ERR(priv->rst_fe)) {
+		err = dev_err_probe(dev, PTR_ERR(priv->rst_fe),
+				    "failed to get fe reset");
+		goto err_clk;
+	}
+
+	if (priv->rst_fe) {
+		err = reset_control_deassert(priv->rst_fe);
+		if (err) {
+			err = dev_err_probe(dev, err,
+					    "failed to deassert fe reset");
+			goto err_clk;
+		}
+	}
+
+
+	sdm_np = of_parse_phandle(dev->of_node, "ralink,sdm", 0);
+	if (!sdm_np) {
+		if (priv->soc->needs_sdm) {
+			err = dev_err_probe(dev, -EINVAL,
+				     "missing required ralink,sdm phandle");
+			goto err_reset;
+		}
+
+		priv->sdm = NULL;
+		return 0;
+	} else {
+		priv->sdm = syscon_node_to_regmap(sdm_np);
+		of_node_put(sdm_np);
+
+		if (IS_ERR(priv->sdm)) {
+			err = dev_err_probe(dev, PTR_ERR(priv->sdm),
+				    "failed to get SDM regmap");
+			goto err_reset;
+		}
+	}
+
+	ralink_fe_setup_sdm(priv);
+
+	return 0;
+
+err_reset:
+	if (priv->rst_fe)
+		reset_control_assert(priv->rst_fe);
+err_clk:
+	clk_disable_unprepare(priv->clk);
+	return err;
+}
+
+static void ralink_fe_hw_cleanup(struct ralink_fe_priv *priv)
+{
+	if (priv->rst_fe)
+		reset_control_assert(priv->rst_fe);
+
+	if (priv->clk)
+		clk_disable_unprepare(priv->clk);
+}
+
+
 static int ralink_fe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -62,6 +164,10 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	priv->txqs = soc->txqs;
 	priv->rxqs = soc->rxqs;
 
+	err = ralink_fe_hw_init(pdev, priv);
+	if (err)
+		return err;
+
 	ndev->netdev_ops = &ralink_fe_netdev_ops;
 	platform_set_drvdata(pdev, priv);
 
@@ -79,6 +185,7 @@ static void ralink_fe_remove(struct platform_device *pdev)
 	struct ralink_fe_priv *priv = platform_get_drvdata(pdev);
 
 	unregister_netdev(priv->ndev);
+	ralink_fe_hw_cleanup(priv);
 }
 
 static const struct ralink_fe_soc_data rt5350_data = {
