@@ -627,10 +627,26 @@ static netdev_tx_t ralink_fe_start_xmit(struct sk_buff *skb,
 	return ralink_fe_tx_xmit_sg(priv, ring, txq, skb, q);
 }
 
+static int ralink_fe_set_mac_addr(struct net_device *ndev, void *p)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	int ret;
+
+	ret = eth_mac_addr(ndev, p);
+	if (ret)
+		return ret;
+
+	ralink_fe_hw_set_mac(priv, ndev->dev_addr);
+
+	return 0;
+}
+
 static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_open		= ralink_fe_open,
 	.ndo_stop		= ralink_fe_stop,
 	.ndo_start_xmit		= ralink_fe_start_xmit,
+	.ndo_set_mac_address	= ralink_fe_set_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
 };
 
 static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
