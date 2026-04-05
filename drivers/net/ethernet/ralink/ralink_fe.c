@@ -23,6 +23,9 @@
 static inline u32 ralink_fe_rx_irq_bit(int q) { return BIT(16 + q); }
 static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
 
+static inline u32 ralink_fe_tx_ctx_idx(int q)  { return TX_CTX_IDX0  + (q * 0x10); }
+static inline u32 ralink_fe_tx_dtx_idx(int q)  { return TX_DTX_IDX0  + (q * 0x10); }
+
 static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 {
 	return readl(priv->base + reg);
@@ -102,6 +105,88 @@ static int ralink_fe_stop(struct net_device *ndev)
 {
 	netif_stop_queue(ndev);
 	return 0;
+}
+
+static inline void ralink_fe_tx_unmap_desc(struct ralink_fe_priv *priv,
+					   struct ralink_fe_tx_desc *d, u8 *map)
+{
+	u32 info2 = READ_ONCE(d->info2);
+	u8 m = *map;
+
+	if (TX2_DMA_SDL0_GET(info2)) {
+		dma_addr_t dma = (dma_addr_t)(u32)d->info1;
+		u16 len = TX2_DMA_SDL0_GET(info2);
+
+		if (m & RALINK_FE_TX_MAP0_PAGE)
+			dma_unmap_page(priv->dev, dma, len, DMA_TO_DEVICE);
+		else
+			dma_unmap_single(priv->dev, dma, len, DMA_TO_DEVICE);
+	}
+
+	if (TX2_DMA_SDL1_GET(info2)) {
+		dma_addr_t dma = (dma_addr_t)(u32)d->info3;
+		u16 len = TX2_DMA_SDL1_GET(info2);
+
+		if (m & RALINK_FE_TX_MAP1_PAGE)
+			dma_unmap_page(priv->dev, dma, len, DMA_TO_DEVICE);
+		else
+			dma_unmap_single(priv->dev, dma, len, DMA_TO_DEVICE);
+	}
+
+	*map = 0;
+}
+
+static int ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
+{
+	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+	struct net_device *ndev = priv->ndev;
+	struct netdev_queue *txq = netdev_get_tx_queue(ndev, q);
+	u16 clean = ring->clean_idx & RALINK_FE_TX_RING_MASK;
+	u16 dtx;
+	int pkts = 0;
+	u32 bytes = 0;
+
+	dtx = (ralink_fe_r32(priv, ralink_fe_tx_dtx_idx(q)) & 0x0fff) &
+	      RALINK_FE_TX_RING_MASK;
+	dma_rmb();
+
+	while (clean != dtx && pkts < budget) {
+		struct ralink_fe_tx_desc *d = &ring->desc[clean];
+		struct sk_buff *skb;
+		u32 info2 = READ_ONCE(d->info2);
+		bool done_last = info2 & (TX2_DMA_LS0 | TX2_DMA_LS1);
+
+		ralink_fe_tx_unmap_desc(priv, d, &ring->map[clean]);
+
+		skb = ring->skb[clean];
+		if (done_last && skb) {
+			ring->skb[clean] = NULL;
+			bytes += skb->len;
+			pkts++;
+			consume_skb(skb);
+		}
+
+		clean = (clean + 1) & RALINK_FE_TX_RING_MASK;
+	}
+
+	ring->clean_idx = clean;
+
+	netdev_tx_completed_queue(txq, pkts, bytes);
+
+	if (netif_tx_queue_stopped(txq)) {
+		u16 avail = (clean - ring->cpu_idx -
+			     RALINK_FE_TX_STOP_RESERVE) & RALINK_FE_TX_RING_MASK;
+
+		if (avail >= RALINK_FE_TX_WAKE_THRESH)
+			netif_tx_wake_queue(txq);
+	}
+
+	if (pkts < budget) {
+		if (napi_complete_done(&ring->napi.napi, pkts))
+			ralink_fe_irq_enable(priv, ralink_fe_tx_irq_bit(q));
+	}
+
+	return pkts;
 }
 
 static void ralink_fe_tx_unwind_sg(struct ralink_fe_priv *priv,
@@ -362,8 +447,10 @@ static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
 
 static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
 {
-	/* place holder */
-	return 0;
+	struct ralink_fe_qnapi *qn =
+		container_of(napi, struct ralink_fe_qnapi, napi);
+
+	return ralink_fe_tx_poll_q(qn->priv, qn->q, budget);
 }
 
 static irqreturn_t ralink_fe_irq(int irq, void *data)

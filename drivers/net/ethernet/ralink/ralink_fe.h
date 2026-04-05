@@ -35,6 +35,9 @@
 #define PDMA_INT_STATUS         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x220)
 #define PDMA_INT_ENABLE         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x228)
 
+#define TX_CTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x008)
+#define TX_DTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x00C)
+
 /* ---- PDMA GLO bits ---- */
 #define TX_WB_DDONE             BIT(6)
 #define RX_DMA_BUSY		BIT(3)
@@ -68,12 +71,27 @@ struct ralink_fe_tx_desc {
 	u32 info4; /* reserved (kept 0 for cross-SoC compatibility) */
 };
 
+#define TX2_DMA_SDL1_MASK       GENMASK(13, 0)
+#define TX2_DMA_LS1             BIT(14)
+#define TX2_DMA_SDL0_MASK       GENMASK(29, 16)
+#define TX2_DMA_LS0             BIT(30)
+#define TX2_DMA_DONE            BIT(31)
+
+#define TX2_DMA_SDL1(_x)        FIELD_PREP(TX2_DMA_SDL1_MASK, (_x))
+#define TX2_DMA_SDL0(_x)        FIELD_PREP(TX2_DMA_SDL0_MASK, (_x))
+#define TX2_DMA_SDL1_GET(_x)    FIELD_GET(TX2_DMA_SDL1_MASK, (_x))
+#define TX2_DMA_SDL0_GET(_x)    FIELD_GET(TX2_DMA_SDL0_MASK, (_x))
+
 struct ralink_fe_rx_desc {
 	u32 info1; /* addr */
 	u32 info2; /* len/flags/done */
 	u32 info3;
 	u32 info4; /* checksum flags etc. */
 };
+
+/* ---- private ---- */
+#define RALINK_FE_TX_MAP0_PAGE  BIT(0)
+#define RALINK_FE_TX_MAP1_PAGE  BIT(1)
 
 struct ralink_fe_soc_data {
 	u8				txqs;
