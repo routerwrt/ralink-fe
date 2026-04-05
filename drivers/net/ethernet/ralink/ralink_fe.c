@@ -97,16 +97,20 @@ static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 	regmap_write(priv->sdm, SDM_MAC_ADRL, lo);
 }
 
-static int ralink_fe_open(struct net_device *ndev)
+static void ralink_fe_rx_release_ring(struct ralink_fe_priv *priv, int q)
 {
-	netif_start_queue(ndev);
-	return 0;
-}
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+	int i;
 
-static int ralink_fe_stop(struct net_device *ndev)
-{
-	netif_stop_queue(ndev);
-	return 0;
+	for (i = 0; i < RALINK_FE_RX_RING_SIZE; i++) {
+		struct ralink_fe_rx_buf *b = &ring->buf[i];
+
+		if (b->page) {
+			page_pool_put_full_page(ring->pp, b->page, true);
+			b->page = NULL;
+			b->dma = 0;
+		}
+	}
 }
 
 static inline void ralink_fe_tx_unmap_desc(struct ralink_fe_priv *priv,
@@ -136,6 +140,60 @@ static inline void ralink_fe_tx_unmap_desc(struct ralink_fe_priv *priv,
 	}
 
 	*map = 0;
+}
+
+static int ralink_fe_open(struct net_device *ndev)
+{
+	netif_start_queue(ndev);
+	return 0;
+}
+
+static int ralink_fe_stop(struct net_device *ndev)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	int q, i;
+
+	netif_tx_stop_all_queues(ndev);
+
+	ralink_fe_irq_disable(priv, priv->irq_mask_all);
+	synchronize_irq(priv->irq);
+
+	for (q = 0; q < priv->txqs; q++)
+		napi_disable(&priv->tx_ring[q].napi.napi);
+
+	napi_disable(&priv->rx_napi_all);
+
+	if (ralink_fe_dma_disable(priv))
+		netdev_warn(ndev, "DMA did not stop cleanly\n");
+
+	for (q = 0; q < priv->txqs; q++) {
+		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+
+		for (i = 0; i < RALINK_FE_TX_RING_SIZE; i++) {
+			if (ring->skb[i]) {
+				dev_kfree_skb_any(ring->skb[i]);
+				ring->skb[i] = NULL;
+			}
+
+			ralink_fe_tx_unmap_desc(priv, &ring->desc[i], &ring->map[i]);
+
+			ring->desc[i].info1 = 0;
+			ring->desc[i].info3 = 0;
+			ring->desc[i].info4 = 0;
+			WRITE_ONCE(ring->desc[i].info2, TX2_DMA_DONE);
+		}
+
+		ring->cpu_idx = 0;
+		ring->clean_idx = 0;
+		ralink_fe_w32(priv, 0, ralink_fe_tx_ctx_idx(q));
+	}
+
+	for (q = 0; q < priv->rxqs; q++)
+		ralink_fe_rx_release_ring(priv, q);
+
+	netif_carrier_off(ndev);
+
+	return 0;
 }
 
 static int ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
