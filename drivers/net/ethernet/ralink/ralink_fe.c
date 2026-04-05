@@ -17,6 +17,10 @@
 
 #include "ralink_fe.h"
 
+/* --- per-queue register helpers --- */
+static inline u32 ralink_fe_rx_irq_bit(int q) { return BIT(16 + q); }
+static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
+
 static int ralink_fe_open(struct net_device *ndev)
 {
 	netif_start_queue(ndev);
@@ -41,6 +45,18 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_stop		= ralink_fe_stop,
 	.ndo_start_xmit		= ralink_fe_start_xmit,
 };
+
+static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
+{
+	/* place holder */
+	return 0;
+}
+
+static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
+{
+	/* place holder */
+	return 0;
+}
 
 static int ralink_fe_pp_create(struct ralink_fe_priv *priv, int q)
 {
@@ -114,6 +130,50 @@ static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 		v &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
 		regmap_write(priv->sdm, SDM_CON, v);
 	}
+}
+
+static int ralink_fe_init_queues(struct net_device *ndev,
+				 struct ralink_fe_priv *priv)
+{
+	u32 tx_irq_mask = 0;
+	int q;
+
+	priv->rx_irq_mask = 0;
+
+	for (q = 0; q < priv->rxqs; q++)
+		priv->rx_irq_mask |= ralink_fe_rx_irq_bit(q);
+
+	for (q = 0; q < priv->txqs; q++)
+		tx_irq_mask |= ralink_fe_tx_irq_bit(q);
+
+	priv->irq_mask_all = priv->rx_irq_mask | tx_irq_mask;
+
+	for (q = 0; q < priv->txqs; q++) {
+		priv->tx_ring[q].napi.priv = priv;
+		priv->tx_ring[q].napi.q = q;
+
+		netif_napi_add_tx_weight(ndev,
+			&priv->tx_ring[q].napi.napi,
+			ralink_fe_tx_poll,
+			RALINK_FE_NAPI_TX);
+	}
+
+	netif_napi_add_weight(ndev,
+		&priv->rx_napi_all,
+		ralink_fe_rx_poll_all,
+		RALINK_FE_NAPI_RX);
+
+	return 0;
+}
+
+static void ralink_fe_napi_cleanup(struct ralink_fe_priv *priv)
+{
+	int q;
+
+	for (q = 0; q < priv->txqs; q++)
+		netif_napi_del(&priv->tx_ring[q].napi.napi);
+
+	netif_napi_del(&priv->rx_napi_all);
 }
 
 static int ralink_fe_hw_init(struct platform_device *pdev,
@@ -232,9 +292,13 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
-	err = ralink_fe_init_page_pools(priv);
+	err = ralink_fe_init_queues(ndev, priv);
 	if (err)
 		goto err_hw;
+
+	err = ralink_fe_init_page_pools(priv);
+	if (err)
+		goto err_napi;
 
 	ndev->netdev_ops = &ralink_fe_netdev_ops;
 	platform_set_drvdata(pdev, priv);
@@ -247,6 +311,8 @@ static int ralink_fe_probe(struct platform_device *pdev)
 
 	return 0;
 
+err_napi:
+	ralink_fe_napi_cleanup(priv);
 err_hw:
 	ralink_fe_hw_cleanup(priv);
 	return err;
