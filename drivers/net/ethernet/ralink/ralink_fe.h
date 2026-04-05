@@ -38,6 +38,8 @@
 #define TX_CTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x008)
 #define TX_DTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x00C)
 
+#define RX_CTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x108)
+
 /* ---- PDMA GLO bits ---- */
 #define TX_WB_DDONE             BIT(6)
 #define RX_DMA_BUSY		BIT(3)
@@ -89,6 +91,28 @@ struct ralink_fe_rx_desc {
 	u32 info4; /* checksum flags etc. */
 };
 
+#define RX2_DMA_SDL1_MASK       GENMASK(13, 0)
+#define RX2_DMA_SDL0_MASK       GENMASK(29, 16)
+#define RX2_DMA_LS0             BIT(30)
+#define RX2_DMA_DONE            BIT(31)
+
+#define RX2_DMA_SDL1(_x)        FIELD_PREP(RX2_DMA_SDL1_MASK, (_x))
+#define RX2_DMA_SDL0(_x)        FIELD_PREP(RX2_DMA_SDL0_MASK, (_x))
+#define RX2_DMA_SDL1_GET(_x)    FIELD_GET(RX2_DMA_SDL1_MASK, (_x))
+#define RX2_DMA_SDL0_GET(_x)    FIELD_GET(RX2_DMA_SDL0_MASK, (_x))
+
+/*
+ * RX4_DMA_L4FVLD means the L4 checksum result is valid for this packet
+ * (IPv4, no fragments, TCP/UDP). RX4_DMA_L4F indicates checksum failure.
+ */
+#define RX4_DMA_IPFVLD		BIT(31)
+#define RX4_DMA_L4FVLD          BIT(30)
+#define RX4_DMA_IPF		BIT(29)
+#define RX4_DMA_L4F		BIT(28)
+#define RX4_DMA_SP		GENMASK(26, 24)
+#define RX4_DMA_PAR_RLT		GENMASK(23, 16)
+#define RX4_DMA_ADR		GENMASK(1,0)
+
 /* ---- private ---- */
 #define RALINK_FE_TX_MAP0_PAGE  BIT(0)
 #define RALINK_FE_TX_MAP1_PAGE  BIT(1)
@@ -135,6 +159,8 @@ struct ralink_fe_rx_ring {
 
 	struct page_pool		*pp;
 	struct ralink_fe_rx_buf		buf[RALINK_FE_RX_RING_SIZE];
+
+	u32				refill_fail;
 };
 
 struct ralink_fe_priv {

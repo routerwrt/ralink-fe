@@ -26,6 +26,8 @@ static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
 static inline u32 ralink_fe_tx_ctx_idx(int q)  { return TX_CTX_IDX0  + (q * 0x10); }
 static inline u32 ralink_fe_tx_dtx_idx(int q)  { return TX_DTX_IDX0  + (q * 0x10); }
 
+static inline u32 ralink_fe_rx_crx_idx(int q)  { return RX_CTX_IDX0  + (q * 0x10); }
+
 static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 {
 	return readl(priv->base + reg);
@@ -439,10 +441,131 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_start_xmit		= ralink_fe_start_xmit,
 };
 
+static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
+					   u32 *bytes)
+{
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+	struct net_device *ndev = priv->ndev;
+	u16 cpu = (ring->cpu_idx + 1) & RALINK_FE_RX_RING_MASK;
+	struct ralink_fe_rx_desc *d = &ring->desc[cpu];
+	struct ralink_fe_rx_buf *b = &ring->buf[cpu];
+	struct sk_buff *skb;
+	struct page *page;
+	dma_addr_t dma;
+	u32 info2, rxsum, len;
+
+	*bytes = 0;
+
+	info2 = READ_ONCE(d->info2);
+	if (!(info2 & RX2_DMA_DONE))
+		return 0;
+
+	dma_rmb();
+	rxsum = READ_ONCE(d->info4);
+	len = RX2_DMA_SDL0_GET(info2);
+
+	page = page_pool_dev_alloc_pages(ring->pp);
+	if (unlikely(!page)) {
+		ring->refill_fail++;
+
+		page = b->page;
+		dma = b->dma;
+		goto rx_rearm;
+	}
+
+	dma = page_pool_get_dma_addr(page);
+
+	dma_sync_single_for_cpu(priv->dev,
+				b->dma + RALINK_FE_RX_HEADROOM_BYTES,
+				len, DMA_FROM_DEVICE);
+
+	skb = napi_build_skb(page_address(b->page), PAGE_SIZE);
+	if (unlikely(!skb)) {
+		page_pool_put_full_page(ring->pp, b->page, true);
+		goto rx_rearm;
+	}
+
+	skb_mark_for_recycle(skb);
+	skb_reserve(skb, RALINK_FE_RX_HEADROOM_BYTES);
+	skb_put(skb, len);
+
+	if ((rxsum & RX4_DMA_L4FVLD) &&
+	    !(rxsum & RX4_DMA_L4F) &&
+	    !(rxsum & RX4_DMA_IPF))
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+	else
+		skb_checksum_none_assert(skb);
+
+	skb->protocol = eth_type_trans(skb, ndev);
+	skb_record_rx_queue(skb, q);
+	napi_gro_receive(&priv->rx_napi_all, skb);
+
+	*bytes = len;
+
+rx_rearm:
+	b->page = page;
+	b->dma = dma;
+
+	d->info1 = (u32)(dma + RALINK_FE_RX_HEADROOM_BYTES);
+	/*
+	 * Single-buffer RX descriptor:
+	 * SDP0 points at the receive buffer, LS0 marks it as the
+	 * last/only segment, and DDONE is cleared for device ownership.
+	 */
+	WRITE_ONCE(d->info2, RX2_DMA_LS0);
+
+	ring->cpu_idx = cpu;
+	return 1;
+}
+
 static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
 {
-	/* place holder */
-	return 0;
+	struct ralink_fe_priv *priv =
+		container_of(napi, struct ralink_fe_priv, rx_napi_all);
+	u32 mmio_mask = 0;
+	u32 rx_pkts[RALINK_FE_MAX_RXQ] = {};
+	u32 rx_bytes[RALINK_FE_MAX_RXQ] = {};
+	int work_done = 0;
+	int q = 0;
+	int idle = 0;
+	int i;
+
+	while (work_done < budget && idle < priv->rxqs) {
+		u32 bytes;
+
+		if (ralink_fe_rx_consume_one(priv, q, &bytes)) {
+			work_done++;
+			idle = 0;
+			mmio_mask |= BIT(q);
+
+			if (bytes) {
+				rx_pkts[q]++;
+				rx_bytes[q] += bytes;
+			}
+		} else {
+			idle++;
+		}
+
+		if (++q == priv->rxqs)
+			q = 0;
+	}
+
+	if (mmio_mask) {
+		dma_wmb();
+
+		for (i = 0; i < priv->rxqs; i++) {
+			if (mmio_mask & BIT(i))
+				ralink_fe_w32(priv, priv->rx_ring[i].cpu_idx,
+					      ralink_fe_rx_crx_idx(i));
+		}
+	}
+
+	if (work_done < budget) {
+		if (napi_complete_done(&priv->rx_napi_all, work_done))
+			ralink_fe_irq_enable(priv, priv->rx_irq_mask);
+	}
+
+	return work_done;
 }
 
 static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
