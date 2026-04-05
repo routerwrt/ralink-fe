@@ -104,11 +104,248 @@ static int ralink_fe_stop(struct net_device *ndev)
 	return 0;
 }
 
+static void ralink_fe_tx_unwind_sg(struct ralink_fe_priv *priv,
+				   struct ralink_fe_tx_ring *ring,
+				   u16 first_desc, int needed_desc,
+				   const u32 *info2)
+{
+	int i;
+
+	for (i = 0; i < needed_desc; i++) {
+		u16 didx = (first_desc + i) & RALINK_FE_TX_RING_MASK;
+		struct ralink_fe_tx_desc *d = &ring->desc[didx];
+
+		/*
+		 * Reconstruct descriptor length fields so tx_unmap_desc()
+		 * can unmap any segments successfully mapped before failure.
+		 * Ownership stays with the CPU.
+		 */
+		WRITE_ONCE(d->info2, TX2_DMA_DONE | info2[i]);
+		ralink_fe_tx_unmap_desc(priv, d, &ring->map[didx]);
+
+		ring->skb[didx] = NULL;
+		d->info1 = 0;
+		d->info3 = 0;
+		d->info4 = 0;
+		WRITE_ONCE(d->info2, TX2_DMA_DONE);
+	}
+}
+
+static netdev_tx_t
+ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
+			 struct ralink_fe_tx_ring *ring,
+			 struct netdev_queue *txq,
+			 struct sk_buff *skb, int q)
+{
+	u16 first_desc = ring->cpu_idx;
+	u16 clean = ring->clean_idx;
+	u16 avail;
+	u16 new_cpu;
+	struct ralink_fe_tx_desc *d = &ring->desc[first_desc];
+	dma_addr_t dma;
+	u16 len;
+	u32 desc_info2;
+
+	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
+		RALINK_FE_TX_RING_MASK;
+	if (unlikely(avail < 1)) {
+		ring->ring_full++;
+		netif_tx_stop_queue(txq);
+		return NETDEV_TX_BUSY;
+	}
+
+	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
+		if (skb_checksum_help(skb)) {
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+	}
+
+	if (skb_put_padto(skb, ETH_ZLEN))
+		return NETDEV_TX_OK;
+
+	len = skb_headlen(skb);
+
+	dma = dma_map_single(priv->dev, skb->data, len, DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(priv->dev, dma)))
+		goto err_drop;
+
+	ring->map[first_desc] = 0;
+	ring->skb[first_desc] = skb;
+
+	desc_info2 = TX2_DMA_SDL0(len) | TX2_DMA_LS0;
+
+	d->info1 = (u32)dma;
+	d->info3 = 0;
+	d->info4 = 0;
+	dma_wmb();
+	WRITE_ONCE(d->info2, desc_info2);
+
+	new_cpu = (first_desc + 1) & RALINK_FE_TX_RING_MASK;
+	ring->cpu_idx = new_cpu;
+
+	netdev_tx_sent_queue(txq, skb->len);
+
+	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
+		ralink_fe_w32(priv, new_cpu, ralink_fe_tx_ctx_idx(q));
+
+	return NETDEV_TX_OK;
+
+err_drop:
+	dev_kfree_skb_any(skb);
+
+	return NETDEV_TX_OK;
+}
+
+static netdev_tx_t
+ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
+		     struct ralink_fe_tx_ring *ring,
+		     struct netdev_queue *txq,
+		     struct sk_buff *skb, int q)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	u16 first_desc = ring->cpu_idx;
+	u16 clean = ring->clean_idx;
+	u16 avail;
+	u16 new_cpu;
+	u16 last_didx;
+	u32 info2[DIV_ROUND_UP(MAX_SKB_FRAGS + 1, 2)];
+	int nr_frags = shinfo->nr_frags;
+	int segs = 1 + nr_frags;
+	int needed_desc = (segs + 1) >> 1;
+	int i, fidx;
+
+	/*
+	 * PDMA supports scatter-gather TX. Each descriptor carries up to
+	 * two DMA segments, so a packet may span multiple descriptors.
+	 */
+	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
+		RALINK_FE_TX_RING_MASK;
+	if (unlikely(avail < needed_desc)) {
+		ring->ring_full++;
+		netif_tx_stop_queue(txq);
+		return NETDEV_TX_BUSY;
+	}
+
+	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
+		if (skb_checksum_help(skb)) {
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+	}
+
+	if (skb_put_padto(skb, ETH_ZLEN))
+		return NETDEV_TX_OK;
+
+	for (i = 0; i < needed_desc; i++) {
+		u16 didx = (first_desc + i) & RALINK_FE_TX_RING_MASK;
+
+		ring->map[didx] = 0;
+		ring->skb[didx] = NULL;
+		info2[i] = 0;
+	}
+
+	/* Head goes in slot0 of the first descriptor. */
+	{
+		struct ralink_fe_tx_desc *d = &ring->desc[first_desc];
+		dma_addr_t dma;
+		u16 len = skb_headlen(skb);
+
+		dma = dma_map_single(priv->dev, skb->data, len, DMA_TO_DEVICE);
+		if (unlikely(dma_mapping_error(priv->dev, dma)))
+			goto err_drop;
+
+		d->info1 = (u32)dma;
+		d->info3 = 0;
+		d->info4 = 0;
+		info2[0] = TX2_DMA_SDL0(len);
+	}
+
+	last_didx = first_desc;
+
+	for (fidx = 0; fidx < nr_frags; fidx++) {
+		skb_frag_t *f = &shinfo->frags[fidx];
+		int seg = fidx + 1;
+		int didx_off = seg >> 1;
+		bool last = (fidx == nr_frags - 1);
+		u16 didx = (first_desc + didx_off) & RALINK_FE_TX_RING_MASK;
+		struct ralink_fe_tx_desc *d = &ring->desc[didx];
+		dma_addr_t dma;
+		u16 len = skb_frag_size(f);
+
+		dma = skb_frag_dma_map(priv->dev, f, 0, len, DMA_TO_DEVICE);
+		if (unlikely(dma_mapping_error(priv->dev, dma)))
+			goto err_unwind_sg;
+
+		if (seg & 1) {
+			ring->map[didx] |= RALINK_FE_TX_MAP1_PAGE;
+			d->info3 = (u32)dma;
+			info2[didx_off] |= TX2_DMA_SDL1(len);
+			if (last)
+				info2[didx_off] |= TX2_DMA_LS1;
+		} else {
+			ring->map[didx] |= RALINK_FE_TX_MAP0_PAGE;
+			d->info1 = (u32)dma;
+			info2[didx_off] |= TX2_DMA_SDL0(len);
+			if (last)
+				info2[didx_off] |= TX2_DMA_LS0;
+		}
+
+		if (last)
+			last_didx = didx;
+	}
+
+	/* Completion frees skb from the last descriptor only. */
+	ring->skb[last_didx] = skb;
+	dma_wmb();
+
+	for (i = 0; i < needed_desc; i++) {
+		u16 didx = (first_desc + i) & RALINK_FE_TX_RING_MASK;
+
+		WRITE_ONCE(ring->desc[didx].info2, info2[i]);
+	}
+
+	new_cpu = (first_desc + needed_desc) & RALINK_FE_TX_RING_MASK;
+	ring->cpu_idx = new_cpu;
+
+	netdev_tx_sent_queue(txq, skb->len);
+
+	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
+		ralink_fe_w32(priv, new_cpu, ralink_fe_tx_ctx_idx(q));
+
+	return NETDEV_TX_OK;
+
+err_unwind_sg:
+	ralink_fe_tx_unwind_sg(priv, ring, first_desc, needed_desc, info2);
+	dev_kfree_skb_any(skb);
+
+	return NETDEV_TX_OK;
+
+err_drop:
+	dev_kfree_skb_any(skb);
+
+	return NETDEV_TX_OK;
+}
+
 static netdev_tx_t ralink_fe_start_xmit(struct sk_buff *skb,
 					struct net_device *ndev)
 {
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	struct ralink_fe_tx_ring *ring;
+	struct netdev_queue *txq;
+	int q;
+
+	q = skb_get_queue_mapping(skb);
+	if (unlikely(q >= priv->txqs))
+		q = 0;
+
+	ring = &priv->tx_ring[q];
+	txq = netdev_get_tx_queue(ndev, q);
+
+	if (likely(!skb_is_nonlinear(skb)))
+		return ralink_fe_tx_xmit_linear(priv, ring, txq, skb, q);
+
+	return ralink_fe_tx_xmit_sg(priv, ring, txq, skb, q);
 }
 
 static const struct net_device_ops ralink_fe_netdev_ops = {

@@ -99,6 +99,8 @@ struct ralink_fe_tx_ring {
 	u8				map[RALINK_FE_TX_RING_SIZE];
 
 	struct ralink_fe_qnapi		napi;
+
+	u32				ring_full;
 };
 
 /* RX buffer (full page) */
