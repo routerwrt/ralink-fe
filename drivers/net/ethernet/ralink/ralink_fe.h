@@ -31,13 +31,18 @@
 #define PDMA_OFFSET              0x0800
 
 #define PDMA_GLO_CFG            (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x204)
+#define PDMA_RST_CFG            (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x208)
 #define PDMA_DLY_INT_CFG        (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x20C)
 #define PDMA_INT_STATUS         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x220)
 #define PDMA_INT_ENABLE         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x228)
 
+#define TX_BASE_PTR0             (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x000)
+#define TX_MAX_CNT0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x004)
 #define TX_CTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x008)
 #define TX_DTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x00C)
 
+#define RX_BASE_PTR0             (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x100)
+#define RX_MAX_CNT0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x104)
 #define RX_CTX_IDX0              (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x108)
 
 /* ---- PDMA GLO bits ---- */
@@ -48,6 +53,24 @@
 #define TX_DMA_EN               BIT(0)
 
 #define PDMA_BT_SIZE_8WORDS     (1 << 4)
+
+/* PDMA TX scheduling */
+#define PDMA_SCH                (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x280)
+#define PDMA_WRR                (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x284)
+#define PDMA_SCH_MODE_MASK      GENMASK(25, 24)
+#define  PDMA_SCH_MODE_WRR      0x0
+#define  PDMA_SCH_MODE_STRICT   0x1 /* all strict */
+#define  PDMA_SCH_MODE_MIXED0   0x2 /* Q3 strict, Q2 / Q1 / Q0 WRR */
+#define  PDMA_SCH_MODE_MIXED1   0x3 /* Q3 > Q2 strict, Q1 / Q0 WRR */
+#define PDMA_SCH_MODE(v)        FIELD_PREP(PDMA_SCH_MODE_MASK, (v))
+#define PDMA_WRR_WT_Q0_MASK     GENMASK(2, 0)
+#define PDMA_WRR_WT_Q1_MASK     GENMASK(6, 4)
+#define PDMA_WRR_WT_Q2_MASK     GENMASK(10, 8)
+#define PDMA_WRR_WT_Q3_MASK     GENMASK(14, 12)
+#define PDMA_WRR_WT_Q0(v)       FIELD_PREP(PDMA_WRR_WT_Q0_MASK, (v))
+#define PDMA_WRR_WT_Q1(v)       FIELD_PREP(PDMA_WRR_WT_Q1_MASK, (v))
+#define PDMA_WRR_WT_Q2(v)       FIELD_PREP(PDMA_WRR_WT_Q2_MASK, (v))
+#define PDMA_WRR_WT_Q3(v)       FIELD_PREP(PDMA_WRR_WT_Q3_MASK, (v))
 
 /* SDM – Switch DMA glue block */
 
