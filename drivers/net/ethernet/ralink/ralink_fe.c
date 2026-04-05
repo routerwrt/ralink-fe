@@ -23,6 +23,60 @@
 static inline u32 ralink_fe_rx_irq_bit(int q) { return BIT(16 + q); }
 static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
 
+static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
+{
+	return readl(priv->base + reg);
+}
+
+static inline void ralink_fe_w32(struct ralink_fe_priv *priv, u32 val, u32 reg)
+{
+	writel(val, priv->base + reg);
+}
+
+static void ralink_fe_irq_enable(struct ralink_fe_priv *priv, u32 mask)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->irq_lock, flags);
+	priv->irq_mask |= mask;
+	ralink_fe_w32(priv, priv->irq_mask, PDMA_INT_ENABLE);
+	spin_unlock_irqrestore(&priv->irq_lock, flags);
+}
+
+static void ralink_fe_irq_disable(struct ralink_fe_priv *priv, u32 mask)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->irq_lock, flags);
+	priv->irq_mask &= ~mask;
+	ralink_fe_w32(priv, priv->irq_mask, PDMA_INT_ENABLE);
+	spin_unlock_irqrestore(&priv->irq_lock, flags);
+}
+
+static int ralink_fe_dma_disable(struct ralink_fe_priv *priv)
+{
+	u32 v;
+
+	v = ralink_fe_r32(priv, PDMA_GLO_CFG);
+	v &= ~(RX_DMA_EN | TX_DMA_EN);
+	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
+
+	return readl_poll_timeout(priv->base + PDMA_GLO_CFG, v,
+				  !(v & (RX_DMA_BUSY | TX_DMA_BUSY)),
+				  1000, 200000);
+}
+
+static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
+{
+	u32 v;
+
+	/* keep core simple: no delay IRQ/coalesce */
+	ralink_fe_w32(priv, 0, PDMA_DLY_INT_CFG);
+
+	v = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | PDMA_BT_SIZE_8WORDS;
+	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
+}
+
 static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 {
 	u32 lo, hi;
@@ -73,6 +127,41 @@ static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
 {
 	/* place holder */
 	return 0;
+}
+
+static irqreturn_t ralink_fe_irq(int irq, void *data)
+{
+	struct ralink_fe_priv *priv = data;
+	u32 st = ralink_fe_r32(priv, PDMA_INT_STATUS) & READ_ONCE(priv->irq_mask);
+	irqreturn_t ret = IRQ_NONE;
+	int nq = max_t(int, priv->txqs, priv->rxqs);
+	bool rx = false;
+	int q;
+
+	if (!st)
+		return IRQ_NONE;
+
+	ralink_fe_irq_disable(priv, st);
+	ralink_fe_w32(priv, st, PDMA_INT_STATUS);
+
+	for (q = 0; q < nq; q++) {
+		if (q < priv->rxqs && (st & ralink_fe_rx_irq_bit(q))) {
+			rx = true;
+			ret = IRQ_HANDLED;
+		}
+
+		if (q < priv->txqs && (st & ralink_fe_tx_irq_bit(q))) {
+			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi)) {
+				__napi_schedule(&priv->tx_ring[q].napi.napi);
+				ret = IRQ_HANDLED;
+			}
+		}
+	}
+
+	if (rx && napi_schedule_prep(&priv->rx_napi_all))
+		__napi_schedule(&priv->rx_napi_all);
+
+	return ret;
 }
 
 static void ralink_fe_setup_netdev(struct net_device *ndev,
@@ -337,6 +426,17 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	ralink_fe_setup_netdev(ndev, priv);
 
 	platform_set_drvdata(pdev, priv);
+
+	ralink_fe_dma_disable(priv);
+	ralink_fe_w32(priv, 0xffffffff, PDMA_INT_STATUS);
+	ralink_fe_w32(priv, 0, PDMA_INT_ENABLE);
+
+	err = devm_request_irq(dev, priv->irq, ralink_fe_irq, 0,
+			       dev_name(dev), priv);
+	if (err) {
+		err = dev_err_probe(dev, err, "failed to request IRQ");
+		goto err_pp;
+	}
 
 	err = register_netdev(ndev);
 	if (err)

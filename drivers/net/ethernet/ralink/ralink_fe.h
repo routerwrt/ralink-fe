@@ -26,6 +26,24 @@
 #define RALINK_FE_MAX_TXQ          4
 #define RALINK_FE_MAX_RXQ          2
 
+/* ---- Base offsets ---- */
+#define RALINK_FRAME_ENGINE_BASE  0
+#define PDMA_OFFSET              0x0800
+
+#define PDMA_GLO_CFG            (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x204)
+#define PDMA_DLY_INT_CFG        (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x20C)
+#define PDMA_INT_STATUS         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x220)
+#define PDMA_INT_ENABLE         (RALINK_FRAME_ENGINE_BASE + PDMA_OFFSET + 0x228)
+
+/* ---- PDMA GLO bits ---- */
+#define TX_WB_DDONE             BIT(6)
+#define RX_DMA_BUSY		BIT(3)
+#define RX_DMA_EN               BIT(2)
+#define TX_DMA_BUSY		BIT(1)
+#define TX_DMA_EN               BIT(0)
+
+#define PDMA_BT_SIZE_8WORDS     (1 << 4)
+
 /* SDM – Switch DMA glue block */
 
 /* SDM registers */
