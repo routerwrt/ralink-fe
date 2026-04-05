@@ -13,6 +13,8 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
+#include <net/page_pool/helpers.h>
+
 #include "ralink_fe.h"
 
 static int ralink_fe_open(struct net_device *ndev)
@@ -39,6 +41,68 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_stop		= ralink_fe_stop,
 	.ndo_start_xmit		= ralink_fe_start_xmit,
 };
+
+static int ralink_fe_pp_create(struct ralink_fe_priv *priv, int q)
+{
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+	struct page_pool_params pp = {
+		.flags     = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		.order     = 0,
+		.pool_size = RALINK_FE_RX_RING_SIZE + (RALINK_FE_RX_RING_SIZE / 2),
+		.nid       = NUMA_NO_NODE,
+		.dev       = priv->dev,
+		.dma_dir   = DMA_FROM_DEVICE,
+		.max_len   = RALINK_FE_MAX_DMA_LEN,
+		.offset    = RALINK_FE_RX_HEADROOM_BYTES,
+	};
+
+	ring->pp = page_pool_create(&pp);
+	if (IS_ERR(ring->pp)) {
+		int err = PTR_ERR(ring->pp);
+
+		ring->pp = NULL;
+		return err;
+	}
+
+	return 0;
+}
+
+static void ralink_fe_pp_destroy(struct ralink_fe_priv *priv, int q)
+{
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+
+	if (ring->pp) {
+		page_pool_destroy(ring->pp);
+		ring->pp = NULL;
+	}
+}
+
+static int ralink_fe_init_page_pools(struct ralink_fe_priv *priv)
+{
+	int q, err;
+
+	for (q = 0; q < priv->rxqs; q++) {
+		err = ralink_fe_pp_create(priv, q);
+		if (err)
+			goto err;
+	}
+
+	return 0;
+
+err:
+	while (--q >= 0)
+		ralink_fe_pp_destroy(priv, q);
+
+	return err;
+}
+
+static void ralink_fe_cleanup_page_pools(struct ralink_fe_priv *priv)
+{
+	int q;
+
+	for (q = 0; q < priv->rxqs; q++)
+		ralink_fe_pp_destroy(priv, q);
+}
 
 static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 {
@@ -168,6 +232,10 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	if (err)
 		return err;
 
+	err = ralink_fe_init_page_pools(priv);
+	if (err)
+		goto err_hw;
+
 	ndev->netdev_ops = &ralink_fe_netdev_ops;
 	platform_set_drvdata(pdev, priv);
 
@@ -178,6 +246,10 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	dev_info(dev, "Ralink FE: %u TXQ / %u RXQ\n", priv->txqs, priv->rxqs);
 
 	return 0;
+
+err_hw:
+	ralink_fe_hw_cleanup(priv);
+	return err;
 }
 
 static void ralink_fe_remove(struct platform_device *pdev)
@@ -185,6 +257,7 @@ static void ralink_fe_remove(struct platform_device *pdev)
 	struct ralink_fe_priv *priv = platform_get_drvdata(pdev);
 
 	unregister_netdev(priv->ndev);
+	ralink_fe_cleanup_page_pools(priv);
 	ralink_fe_hw_cleanup(priv);
 }
 
