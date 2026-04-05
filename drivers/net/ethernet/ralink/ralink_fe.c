@@ -4,6 +4,7 @@
  * Copyright (c) 2026 Richard van Schagen <richard@routerwrt.org>
  */
 
+#include <generated/utsrelease.h>
 #include <linux/clk.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
@@ -14,6 +15,8 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/string.h>
+#include <linux/u64_stats_sync.h>
 
 #include <net/dsa.h>
 #include <net/page_pool/helpers.h>
@@ -85,6 +88,33 @@ static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 
 	v = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | PDMA_BT_SIZE_8WORDS;
 	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
+}
+
+static inline void ralink_fe_txq_error(struct ralink_fe_priv *priv, int q)
+{
+	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+
+	u64_stats_update_begin(&ring->syncp);
+	ring->errors++;
+	u64_stats_update_end(&ring->syncp);
+}
+
+static inline void ralink_fe_rxq_drop(struct ralink_fe_priv *priv, int q)
+{
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+
+	u64_stats_update_begin(&ring->syncp);
+	ring->dropped++;
+	u64_stats_update_end(&ring->syncp);
+}
+
+static inline void ralink_fe_txq_drop(struct ralink_fe_priv *priv, int q)
+{
+	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+
+	u64_stats_update_begin(&ring->syncp);
+	ring->dropped++;
+	u64_stats_update_end(&ring->syncp);
 }
 
 static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
@@ -366,6 +396,11 @@ static int ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
 
 	ring->clean_idx = clean;
 
+	u64_stats_update_begin(&ring->syncp);
+	ring->packets += pkts;
+	ring->bytes += bytes;
+	u64_stats_update_end(&ring->syncp);
+
 	netdev_tx_completed_queue(txq, pkts, bytes);
 
 	if (netif_tx_queue_stopped(txq)) {
@@ -436,13 +471,16 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 
 	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
 		if (skb_checksum_help(skb)) {
+			ralink_fe_txq_drop(priv, q);
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_OK;
 		}
 	}
 
-	if (skb_put_padto(skb, ETH_ZLEN))
+	if (skb_put_padto(skb, ETH_ZLEN)) {
+		ralink_fe_txq_drop(priv, q);
 		return NETDEV_TX_OK;
+	}
 
 	len = skb_headlen(skb);
 
@@ -472,6 +510,8 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	return NETDEV_TX_OK;
 
 err_drop:
+	ralink_fe_txq_drop(priv, q);
+	ralink_fe_txq_error(priv, q);
 	dev_kfree_skb_any(skb);
 
 	return NETDEV_TX_OK;
@@ -509,13 +549,16 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 
 	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
 		if (skb_checksum_help(skb)) {
+			ralink_fe_txq_drop(priv, q);
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_OK;
 		}
 	}
 
-	if (skb_put_padto(skb, ETH_ZLEN))
+	if (skb_put_padto(skb, ETH_ZLEN)) {
+		ralink_fe_txq_drop(priv, q);
 		return NETDEV_TX_OK;
+	}
 
 	for (i = 0; i < needed_desc; i++) {
 		u16 didx = (first_desc + i) & RALINK_FE_TX_RING_MASK;
@@ -597,11 +640,15 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 
 err_unwind_sg:
 	ralink_fe_tx_unwind_sg(priv, ring, first_desc, needed_desc, info2);
+	ralink_fe_txq_drop(priv, q);
+	ralink_fe_txq_error(priv, q);
 	dev_kfree_skb_any(skb);
 
 	return NETDEV_TX_OK;
 
 err_drop:
+	ralink_fe_txq_drop(priv, q);
+	ralink_fe_txq_error(priv, q);
 	dev_kfree_skb_any(skb);
 
 	return NETDEV_TX_OK;
@@ -663,6 +710,48 @@ static int ralink_fe_set_mac_addr(struct net_device *ndev, void *p)
 	return 0;
 }
 
+static void ralink_fe_get_stats64(struct net_device *ndev,
+				  struct rtnl_link_stats64 *stats)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	unsigned int start;
+	int q;
+
+	for (q = 0; q < priv->rxqs; q++) {
+		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+		u64 packets, bytes, dropped;
+
+		do {
+			start = u64_stats_fetch_begin(&ring->syncp);
+			packets = ring->packets;
+			bytes   = ring->bytes;
+			dropped = ring->dropped;
+		} while (u64_stats_fetch_retry(&ring->syncp, start));
+
+		stats->rx_packets += packets;
+		stats->rx_bytes   += bytes;
+		stats->rx_dropped += dropped;
+	}
+
+	for (q = 0; q < priv->txqs; q++) {
+		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+		u64 packets, bytes, dropped, errors;
+
+		do {
+			start = u64_stats_fetch_begin(&ring->syncp);
+			packets = ring->packets;
+			bytes   = ring->bytes;
+			dropped = ring->dropped;
+			errors  = ring->errors;
+		} while (u64_stats_fetch_retry(&ring->syncp, start));
+
+		stats->tx_packets += packets;
+		stats->tx_bytes   += bytes;
+		stats->tx_dropped += dropped;
+		stats->tx_errors  += errors;
+	}
+}
+
 static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_open		= ralink_fe_open,
 	.ndo_stop		= ralink_fe_stop,
@@ -670,6 +759,7 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_select_queue	= ralink_fe_select_queue,
 	.ndo_set_mac_address	= ralink_fe_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_get_stats64	= ralink_fe_get_stats64,
 };
 
 static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
@@ -698,6 +788,7 @@ static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
 	page = page_pool_dev_alloc_pages(ring->pp);
 	if (unlikely(!page)) {
 		ring->refill_fail++;
+		ralink_fe_rxq_drop(priv, q);
 
 		page = b->page;
 		dma = b->dma;
@@ -712,6 +803,7 @@ static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
 
 	skb = napi_build_skb(page_address(b->page), PAGE_SIZE);
 	if (unlikely(!skb)) {
+		ralink_fe_rxq_drop(priv, q);
 		page_pool_put_full_page(ring->pp, b->page, true);
 		goto rx_rearm;
 	}
@@ -781,6 +873,18 @@ static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
 			q = 0;
 	}
 
+	for (i = 0; i < priv->rxqs; i++) {
+		struct ralink_fe_rx_ring *ring = &priv->rx_ring[i];
+
+		if (!rx_pkts[i])
+			continue;
+
+		u64_stats_update_begin(&ring->syncp);
+		ring->packets += rx_pkts[i];
+		ring->bytes += rx_bytes[i];
+		u64_stats_update_end(&ring->syncp);
+	}
+
 	if (mmio_mask) {
 		dma_wmb();
 
@@ -842,6 +946,129 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 	return ret;
 }
 
+static void ralink_fe_get_drvinfo(struct net_device *ndev,
+				  struct ethtool_drvinfo *info)
+{
+	strscpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+	strscpy(info->version, UTS_RELEASE, sizeof(info->version));
+	strscpy(info->bus_info, dev_name(ndev->dev.parent), sizeof(info->bus_info));
+}
+
+static u32 ralink_fe_get_msglevel(struct net_device *ndev)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+
+	return priv->msg_enable;
+}
+
+static void ralink_fe_set_msglevel(struct net_device *ndev, u32 value)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+
+	priv->msg_enable = value;
+}
+
+static void ralink_fe_get_ringparam(struct net_device *ndev,
+				    struct ethtool_ringparam *ring,
+				    struct kernel_ethtool_ringparam *kernel_ring,
+				    struct netlink_ext_ack *extack)
+{
+	ring->rx_max_pending = RALINK_FE_RX_RING_SIZE;
+	ring->tx_max_pending = RALINK_FE_TX_RING_SIZE;
+	ring->rx_pending = RALINK_FE_RX_RING_SIZE;
+	ring->tx_pending = RALINK_FE_TX_RING_SIZE;
+}
+
+static int ralink_fe_get_sset_count(struct net_device *ndev, int sset)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+
+	if (sset != ETH_SS_STATS)
+		return -EOPNOTSUPP;
+
+	return priv->txqs * 5 + priv->rxqs * 4;
+}
+
+static void ralink_fe_get_strings(struct net_device *ndev, u32 sset, u8 *data)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	unsigned int q;
+
+	if (sset != ETH_SS_STATS)
+		return;
+
+	for (q = 0; q < priv->txqs; q++) {
+		ethtool_sprintf(&data, "tx_queue_%u_packets", q);
+		ethtool_sprintf(&data, "tx_queue_%u_bytes", q);
+		ethtool_sprintf(&data, "tx_queue_%u_errors", q);
+		ethtool_sprintf(&data, "tx_queue_%u_dropped", q);
+		ethtool_sprintf(&data, "tx_queue_%u_ring_full", q);
+	}
+
+	for (q = 0; q < priv->rxqs; q++) {
+		ethtool_sprintf(&data, "rx_queue_%u_packets", q);
+		ethtool_sprintf(&data, "rx_queue_%u_bytes", q);
+		ethtool_sprintf(&data, "rx_queue_%u_dropped", q);
+		ethtool_sprintf(&data, "rx_queue_%u_refill_fail", q);
+	}
+}
+
+static void ralink_fe_get_ethtool_stats(struct net_device *ndev,
+					struct ethtool_stats *stats, u64 *data)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	unsigned int q, i = 0;
+
+	for (q = 0; q < priv->txqs; q++) {
+		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+		unsigned int start;
+		u64 pkts, bytes, errors, dropped;
+
+		do {
+			start = u64_stats_fetch_begin(&ring->syncp);
+			pkts = ring->packets;
+			bytes = ring->bytes;
+			errors = ring->errors;
+			dropped = ring->dropped;
+		} while (u64_stats_fetch_retry(&ring->syncp, start));
+
+		data[i++] = pkts;
+		data[i++] = bytes;
+		data[i++] = errors;
+		data[i++] = dropped;
+		data[i++] = READ_ONCE(ring->ring_full);
+	}
+
+	for (q = 0; q < priv->rxqs; q++) {
+		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+		unsigned int start;
+		u64 pkts, bytes, dropped;
+
+		do {
+			start = u64_stats_fetch_begin(&ring->syncp);
+			pkts = ring->packets;
+			bytes = ring->bytes;
+			dropped = ring->dropped;
+		} while (u64_stats_fetch_retry(&ring->syncp, start));
+
+		data[i++] = pkts;
+		data[i++] = bytes;
+		data[i++] = dropped;
+		data[i++] = READ_ONCE(ring->refill_fail);
+	}
+}
+
+const struct ethtool_ops ralink_fe_ethtool_ops = {
+	.get_drvinfo		= ralink_fe_get_drvinfo,
+	.get_msglevel		= ralink_fe_get_msglevel,
+	.set_msglevel		= ralink_fe_set_msglevel,
+	.get_link		= ethtool_op_get_link,
+	.get_ringparam		= ralink_fe_get_ringparam,
+	.get_sset_count		= ralink_fe_get_sset_count,
+	.get_strings		= ralink_fe_get_strings,
+	.get_ethtool_stats	= ralink_fe_get_ethtool_stats,
+};
+
 static void ralink_fe_setup_netdev(struct net_device *ndev,
 				   struct ralink_fe_priv *priv)
 {
@@ -859,6 +1086,11 @@ static void ralink_fe_setup_netdev(struct net_device *ndev,
 
 	ndev->max_mtu = RALINK_FE_MAX_DMA_LEN - VLAN_ETH_HLEN;
 	ndev->netdev_ops = &ralink_fe_netdev_ops;
+	ndev->ethtool_ops = &ralink_fe_ethtool_ops;
+
+	priv->msg_enable = NETIF_MSG_DRV |
+			   NETIF_MSG_PROBE |
+			   NETIF_MSG_IFUP;
 }
 
 static int ralink_fe_pp_create(struct ralink_fe_priv *priv, int q)
@@ -943,11 +1175,19 @@ static int ralink_fe_init_queues(struct net_device *ndev,
 
 	priv->rx_irq_mask = 0;
 
-	for (q = 0; q < priv->rxqs; q++)
-		priv->rx_irq_mask |= ralink_fe_rx_irq_bit(q);
+	for (q = 0; q < priv->rxqs; q++) {
+		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
-	for (q = 0; q < priv->txqs; q++)
+		priv->rx_irq_mask |= ralink_fe_rx_irq_bit(q);
+		u64_stats_init(&ring->syncp);
+	}
+
+	for (q = 0; q < priv->txqs; q++) {
+		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+
 		tx_irq_mask |= ralink_fe_tx_irq_bit(q);
+		u64_stats_init(&ring->syncp);
+	}
 
 	priv->irq_mask_all = priv->rx_irq_mask | tx_irq_mask;
 

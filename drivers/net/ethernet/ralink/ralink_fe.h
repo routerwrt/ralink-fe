@@ -165,6 +165,12 @@ struct ralink_fe_tx_ring {
 
 	struct ralink_fe_qnapi		napi;
 
+	struct u64_stats_sync		syncp;
+	u64				packets;
+	u64				bytes;
+	u64				errors;
+	u64				dropped;
+
 	u32				ring_full;
 };
 
@@ -182,6 +188,11 @@ struct ralink_fe_rx_ring {
 
 	struct page_pool		*pp;
 	struct ralink_fe_rx_buf		buf[RALINK_FE_RX_RING_SIZE];
+
+	struct u64_stats_sync		syncp;
+	u64				packets;
+	u64				bytes;
+	u64				dropped;
 
 	u32				refill_fail;
 };
@@ -208,6 +219,8 @@ struct ralink_fe_priv {
 	struct ralink_fe_tx_ring	tx_ring[RALINK_FE_MAX_TXQ];
 	struct ralink_fe_rx_ring	rx_ring[RALINK_FE_MAX_RXQ];
 	struct napi_struct		rx_napi_all;
+
+	u32				msg_enable;
 };
 
 #endif /* __RALINK_FE_H */
