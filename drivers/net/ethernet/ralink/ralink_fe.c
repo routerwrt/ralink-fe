@@ -15,6 +15,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
+#include <net/dsa.h>
 #include <net/page_pool/helpers.h>
 
 #include "ralink_fe.h"
@@ -627,6 +628,27 @@ static netdev_tx_t ralink_fe_start_xmit(struct sk_buff *skb,
 	return ralink_fe_tx_xmit_sg(priv, ring, txq, skb, q);
 }
 
+/*
+ * Preserve queue_mapping assigned by DSA for CPU-port traffic.
+ * For non-DSA users, fall back to the normal core selection policy.
+ */
+static u16 ralink_fe_select_queue(struct net_device *ndev, struct sk_buff *skb,
+				  struct net_device *sb_dev)
+{
+	struct ralink_fe_priv *priv = netdev_priv(ndev);
+	int queue;
+
+	if (likely(netdev_uses_dsa(ndev)))
+		queue = skb_get_queue_mapping(skb);
+	else
+		queue = netdev_pick_tx(ndev, skb, sb_dev);
+
+	if (unlikely(queue >= priv->txqs))
+		queue = 0;
+
+	return queue;
+}
+
 static int ralink_fe_set_mac_addr(struct net_device *ndev, void *p)
 {
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
@@ -645,6 +667,7 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_open		= ralink_fe_open,
 	.ndo_stop		= ralink_fe_stop,
 	.ndo_start_xmit		= ralink_fe_start_xmit,
+	.ndo_select_queue	= ralink_fe_select_queue,
 	.ndo_set_mac_address	= ralink_fe_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };
