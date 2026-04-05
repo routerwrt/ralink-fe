@@ -16,3 +16,4 @@ modules.order
 .DS_Store
 .editorconfig
 .clang-format
+.vscode
