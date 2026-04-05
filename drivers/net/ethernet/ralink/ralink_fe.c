@@ -6,9 +6,11 @@
 
 #include <linux/clk.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_net.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
@@ -20,6 +22,21 @@
 /* --- per-queue register helpers --- */
 static inline u32 ralink_fe_rx_irq_bit(int q) { return BIT(16 + q); }
 static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
+
+static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
+{
+	u32 lo, hi;
+
+	if (!priv->sdm)
+		return;
+
+	hi = ((u32)mac[0] << 8) | mac[1];
+	lo = ((u32)mac[2] << 24) | ((u32)mac[3] << 16) |
+	     ((u32)mac[4] << 8) | mac[5];
+
+	regmap_write(priv->sdm, SDM_MAC_ADRH, hi);
+	regmap_write(priv->sdm, SDM_MAC_ADRL, lo);
+}
 
 static int ralink_fe_open(struct net_device *ndev)
 {
@@ -56,6 +73,25 @@ static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
 {
 	/* place holder */
 	return 0;
+}
+
+static void ralink_fe_setup_netdev(struct net_device *ndev,
+				   struct ralink_fe_priv *priv)
+{
+	struct device *dev = priv->dev;
+	int err;
+
+	err = of_get_ethdev_address(dev->of_node, ndev);
+	if (err)
+		eth_hw_addr_random(ndev);
+
+	ralink_fe_hw_set_mac(priv, ndev->dev_addr);
+
+	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_SG;
+	ndev->features = ndev->hw_features;
+
+	ndev->max_mtu = RALINK_FE_MAX_DMA_LEN - VLAN_ETH_HLEN;
+	ndev->netdev_ops = &ralink_fe_netdev_ops;
 }
 
 static int ralink_fe_pp_create(struct ralink_fe_priv *priv, int q)
@@ -218,7 +254,6 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 		}
 	}
 
-
 	sdm_np = of_parse_phandle(dev->of_node, "ralink,sdm", 0);
 	if (!sdm_np) {
 		if (priv->soc->needs_sdm) {
@@ -261,7 +296,6 @@ static void ralink_fe_hw_cleanup(struct ralink_fe_priv *priv)
 		clk_disable_unprepare(priv->clk);
 }
 
-
 static int ralink_fe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -300,17 +334,20 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	if (err)
 		goto err_napi;
 
-	ndev->netdev_ops = &ralink_fe_netdev_ops;
+	ralink_fe_setup_netdev(ndev, priv);
+
 	platform_set_drvdata(pdev, priv);
 
 	err = register_netdev(ndev);
 	if (err)
-		return err;
+		goto err_pp;
 
 	dev_info(dev, "Ralink FE: %u TXQ / %u RXQ\n", priv->txqs, priv->rxqs);
 
 	return 0;
 
+err_pp:
+	ralink_fe_cleanup_page_pools(priv);
 err_napi:
 	ralink_fe_napi_cleanup(priv);
 err_hw:
