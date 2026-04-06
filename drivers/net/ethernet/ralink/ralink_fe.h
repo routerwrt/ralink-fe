@@ -50,6 +50,7 @@
 #define TX_DMA_EN			BIT(0)
 
 #define PDMA_BT_SIZE_8WORDS		(1 << 4)
+#define PDMA_BT_SIZE_16WORDS		(2 << 4)
 
 /* PDMA TX scheduling */
 #define PDMA_SCH		(PDMA_OFFSET + 0x280)
@@ -138,6 +139,7 @@ struct ralink_fe_soc_data {
 	u8				txqs;
 	u8				rxqs;
 	bool				needs_sdm;
+	u32				pdma_bt_size;
 };
 
 /* Per-queue NAPI wrapper so poll callbacks can recover the queue index. */

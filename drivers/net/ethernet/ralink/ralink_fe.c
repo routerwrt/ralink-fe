@@ -118,7 +118,7 @@ static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 	/* keep core simple: no delay IRQ/coalesce */
 	ralink_fe_w32(priv, 0, PDMA_DLY_INT_CFG);
 
-	v = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | PDMA_BT_SIZE_8WORDS;
+	v = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
 	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
 }
 
@@ -1424,12 +1424,14 @@ static const struct ralink_fe_soc_data rt5350_data = {
 	.txqs = 4,
 	.rxqs = 2,
 	.needs_sdm = true,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 };
 
 static const struct ralink_fe_soc_data mt7628_data = {
 	.txqs = 4,
 	.rxqs = 2,
 	.needs_sdm = true,
+	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
 };
 
 static const struct of_device_id ralink_fe_of_match[] = {
