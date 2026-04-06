@@ -23,25 +23,57 @@
 
 #include "ralink_fe.h"
 
-/* --- per-queue register helpers --- */
-static inline u32 ralink_fe_rx_irq_bit(int q) { return BIT(16 + q); }
-static inline u32 ralink_fe_tx_irq_bit(int q) { return BIT(q); }
+static inline u32 ralink_fe_rx_irq_bit(int q)
+{
+	return BIT(16 + q);
+}
 
-static inline u32 ralink_fe_tx_base_ptr(int q) { return TX_BASE_PTR0 + (q * 0x10); }
-static inline u32 ralink_fe_tx_max_cnt(int q)  { return TX_MAX_CNT0  + (q * 0x10); }
-static inline u32 ralink_fe_tx_ctx_idx(int q)  { return TX_CTX_IDX0  + (q * 0x10); }
-static inline u32 ralink_fe_tx_dtx_idx(int q)  { return TX_DTX_IDX0  + (q * 0x10); }
+static inline u32 ralink_fe_tx_irq_bit(int q)
+{
+	return BIT(q);
+}
 
-static inline u32 ralink_fe_rx_base_ptr(int q) { return RX_BASE_PTR0 + (q * 0x10); }
-static inline u32 ralink_fe_rx_max_cnt(int q)  { return RX_MAX_CNT0  + (q * 0x10); }
-static inline u32 ralink_fe_rx_crx_idx(int q)  { return RX_CTX_IDX0  + (q * 0x10); }
+static inline u32 ralink_fe_tx_base_ptr(int q)
+{
+	return TX_BASE_PTR0 + q * 0x10;
+}
 
+static inline u32 ralink_fe_tx_max_cnt(int q)
+{
+	return TX_MAX_CNT0 + q * 0x10;
+}
+
+static inline u32 ralink_fe_tx_ctx_idx(int q)
+{
+	return TX_CTX_IDX0 + q * 0x10;
+}
+
+static inline u32 ralink_fe_tx_dtx_idx(int q)
+{
+	return TX_DTX_IDX0 + q * 0x10;
+}
+
+static inline u32 ralink_fe_rx_base_ptr(int q)
+{
+	return RX_BASE_PTR0 + q * 0x10;
+}
+
+static inline u32 ralink_fe_rx_max_cnt(int q)
+{
+	return RX_MAX_CNT0 + q * 0x10;
+}
+
+static inline u32 ralink_fe_rx_ctx_idx(int q)
+{
+	return RX_CTX_IDX0 + q * 0x10;
+}
 static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 {
 	return readl(priv->base + reg);
 }
 
-static inline void ralink_fe_w32(struct ralink_fe_priv *priv, u32 val, u32 reg)
+static inline void
+ralink_fe_w32(struct ralink_fe_priv *priv, u32 val, u32 reg)
 {
 	writel(val, priv->base + reg);
 }
@@ -117,7 +149,8 @@ static inline void ralink_fe_txq_drop(struct ralink_fe_priv *priv, int q)
 	u64_stats_update_end(&ring->syncp);
 }
 
-static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
+static void
+ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 {
 	u32 lo, hi;
 
@@ -226,7 +259,7 @@ static void ralink_fe_program_rings(struct ralink_fe_priv *priv)
 		ralink_fe_w32(priv, ring->desc_dma, ralink_fe_rx_base_ptr(q));
 		ralink_fe_w32(priv, RALINK_FE_RX_RING_SIZE, ralink_fe_rx_max_cnt(q));
 		ralink_fe_w32(priv, ralink_fe_rx_irq_bit(q), PDMA_RST_CFG);
-		ralink_fe_w32(priv, RALINK_FE_RX_RING_SIZE - 1, ralink_fe_rx_crx_idx(q));
+		ralink_fe_w32(priv, RALINK_FE_RX_RING_SIZE - 1, ralink_fe_rx_ctx_idx(q));
 	}
 }
 
@@ -263,7 +296,7 @@ static void ralink_fe_rx_ring_publish(struct ralink_fe_priv *priv, int q)
 {
 	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
-	ralink_fe_w32(priv, ring->cpu_idx, ralink_fe_rx_crx_idx(q));
+	ralink_fe_w32(priv, ring->cpu_idx, ralink_fe_rx_ctx_idx(q));
 }
 
 static void ralink_fe_napi_enable(struct ralink_fe_priv *priv)
@@ -361,7 +394,8 @@ static int ralink_fe_stop(struct net_device *ndev)
 	return 0;
 }
 
-static int ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
+static int
+ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
 {
 	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
 	struct net_device *ndev = priv->ndev;
@@ -679,7 +713,8 @@ static netdev_tx_t ralink_fe_start_xmit(struct sk_buff *skb,
  * Preserve queue_mapping assigned by DSA for CPU-port traffic.
  * For non-DSA users, fall back to the normal core selection policy.
  */
-static u16 ralink_fe_select_queue(struct net_device *ndev, struct sk_buff *skb,
+static u16
+ralink_fe_select_queue(struct net_device *ndev, struct sk_buff *skb,
 				  struct net_device *sb_dev)
 {
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
@@ -762,7 +797,8 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_get_stats64	= ralink_fe_get_stats64,
 };
 
-static inline int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
+static inline
+int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
 					   u32 *bytes)
 {
 	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
@@ -891,7 +927,7 @@ static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
 		for (i = 0; i < priv->rxqs; i++) {
 			if (mmio_mask & BIT(i))
 				ralink_fe_w32(priv, priv->rx_ring[i].cpu_idx,
-					      ralink_fe_rx_crx_idx(i));
+					      ralink_fe_rx_ctx_idx(i));
 		}
 	}
 
@@ -951,7 +987,8 @@ static void ralink_fe_get_drvinfo(struct net_device *ndev,
 {
 	strscpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
 	strscpy(info->version, UTS_RELEASE, sizeof(info->version));
-	strscpy(info->bus_info, dev_name(ndev->dev.parent), sizeof(info->bus_info));
+	strscpy(info->bus_info, dev_name(ndev->dev.parent),
+		sizeof(info->bus_info));
 }
 
 static u32 ralink_fe_get_msglevel(struct net_device *ndev)
@@ -989,7 +1026,8 @@ static int ralink_fe_get_sset_count(struct net_device *ndev, int sset)
 	return priv->txqs * 5 + priv->rxqs * 4;
 }
 
-static void ralink_fe_get_strings(struct net_device *ndev, u32 sset, u8 *data)
+static void
+ralink_fe_get_strings(struct net_device *ndev, u32 sset, u8 *data)
 {
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
 	unsigned int q;
@@ -1271,15 +1309,15 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 
 		priv->sdm = NULL;
 		return 0;
-	} else {
-		priv->sdm = syscon_node_to_regmap(sdm_np);
-		of_node_put(sdm_np);
+	}
 
-		if (IS_ERR(priv->sdm)) {
-			err = dev_err_probe(dev, PTR_ERR(priv->sdm),
+	priv->sdm = syscon_node_to_regmap(sdm_np);
+	of_node_put(sdm_np);
+
+	if (IS_ERR(priv->sdm)) {
+		err = dev_err_probe(dev, PTR_ERR(priv->sdm),
 				    "failed to get SDM regmap");
-			goto err_reset;
-		}
+		goto err_reset;
 	}
 
 	ralink_fe_setup_sdm(priv);
@@ -1412,5 +1450,5 @@ static struct platform_driver ralink_fe_driver = {
 module_platform_driver(ralink_fe_driver);
 
 MODULE_AUTHOR("Richard van Schagen <richard@routerwrt.org>");
-MODULE_DESCRIPTION("NIC driver for the Ralink/MediaTek embedded frame engine");
+MODULE_DESCRIPTION("NIC driver for the Ralink/MediaTek FE");
 MODULE_LICENSE("GPL");
