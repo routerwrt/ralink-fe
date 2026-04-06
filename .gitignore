@@ -9,6 +9,7 @@
 .tmp_versions/
 Module.symvers
 modules.order
+patch
 
 # Editor / misc
 *~
