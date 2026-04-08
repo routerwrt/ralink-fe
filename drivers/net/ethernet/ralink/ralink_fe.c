@@ -1205,6 +1205,31 @@ static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 	}
 }
 
+static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
+{
+	int q;
+
+	for (q = 0; q < priv->txqs; q++) {
+		priv->tx_ring[q].desc = dmam_alloc_coherent(priv->dev,
+			sizeof(struct ralink_fe_tx_desc) *
+			RALINK_FE_TX_RING_SIZE,
+			&priv->tx_ring[q].desc_dma, GFP_KERNEL);
+		if (!priv->tx_ring[q].desc)
+			return -ENOMEM;
+	}
+
+	for (q = 0; q < priv->rxqs; q++) {
+		priv->rx_ring[q].desc = dmam_alloc_coherent(priv->dev,
+			sizeof(struct ralink_fe_rx_desc) *
+			RALINK_FE_RX_RING_SIZE,
+			&priv->rx_ring[q].desc_dma, GFP_KERNEL);
+		if (!priv->rx_ring[q].desc)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
 static int ralink_fe_init_queues(struct net_device *ndev,
 				 struct ralink_fe_priv *priv)
 {
@@ -1370,6 +1395,10 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	err = ralink_fe_hw_init(pdev, priv);
 	if (err)
 		return err;
+
+	err = ralink_fe_alloc_desc(priv);
+	if (err)
+		goto err_hw;
 
 	err = ralink_fe_init_queues(ndev, priv);
 	if (err)
