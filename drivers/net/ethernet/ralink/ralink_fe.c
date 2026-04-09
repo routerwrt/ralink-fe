@@ -1412,6 +1412,8 @@ static int ralink_fe_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, priv);
 
+	spin_lock_init(&priv->irq_lock);
+
 	ralink_fe_dma_disable(priv);
 	ralink_fe_w32(priv, 0xffffffff, PDMA_INT_STATUS);
 	ralink_fe_w32(priv, 0, PDMA_INT_ENABLE);
