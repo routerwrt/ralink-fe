@@ -966,9 +966,9 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 		}
 
 		if (q < priv->txqs && (st & ralink_fe_tx_irq_bit(q))) {
-			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi)) {
+			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi))
 				__napi_schedule(&priv->tx_ring[q].napi.napi);
-				ret = IRQ_HANDLED;
+			ret = IRQ_HANDLED;
 		}
 	}
 
