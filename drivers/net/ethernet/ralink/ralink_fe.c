@@ -8,12 +8,10 @@
 #include <linux/clk.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
-#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/string.h>
 #include <linux/u64_stats_sync.h>
@@ -154,15 +152,12 @@ ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 {
 	u32 lo, hi;
 
-	if (!priv->sdm)
-		return;
-
 	hi = ((u32)mac[0] << 8) | mac[1];
 	lo = ((u32)mac[2] << 24) | ((u32)mac[3] << 16) |
 	     ((u32)mac[4] << 8) | mac[5];
 
-	regmap_write(priv->sdm, SDM_MAC_ADRH, hi);
-	regmap_write(priv->sdm, SDM_MAC_ADRL, lo);
+	ralink_fe_w32(priv, hi, SDM_MAC_ADRH);
+	ralink_fe_w32(priv, lo, SDM_MAC_ADRL);
 }
 
 static void ralink_fe_rx_release_ring(struct ralink_fe_priv *priv, int q)
@@ -1197,12 +1192,13 @@ static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 {
 	u32 v;
 
-	if (priv->sdm) {
-		v = SDM_PDMA_FC | SDM_PORT_MAP | SDM_TCI_81XX |
-		    FIELD_PREP(SDM_EXT_VLAN, 0x8100);
-		v &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
-		regmap_write(priv->sdm, SDM_CON, v);
-	}
+	v = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
+
+	ralink_fe_w32(priv, v, SDM_CON);
+	/* priority tag 2 -> RX ring 1 */
+	ralink_fe_w32(priv, BIT(2), SDM_RRING);
+	/* no TX ring pause/FC */
+	ralink_fe_w32(priv, 0, SDM_TRING);
 }
 
 static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
@@ -1286,7 +1282,6 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 			     struct ralink_fe_priv *priv)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *sdm_np;
 	int err;
 
 	priv->base = devm_platform_ioremap_resource(pdev, 0);
@@ -1324,34 +1319,11 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 		}
 	}
 
-	sdm_np = of_parse_phandle(dev->of_node, "ralink,sdm", 0);
-	if (!sdm_np) {
-		if (priv->soc->needs_sdm) {
-			err = dev_err_probe(dev, -EINVAL,
-				     "missing required ralink,sdm phandle");
-			goto err_reset;
-		}
-
-		priv->sdm = NULL;
-		return 0;
-	}
-
-	priv->sdm = syscon_node_to_regmap(sdm_np);
-	of_node_put(sdm_np);
-
-	if (IS_ERR(priv->sdm)) {
-		err = dev_err_probe(dev, PTR_ERR(priv->sdm),
-				    "failed to get SDM regmap");
-		goto err_reset;
-	}
-
-	ralink_fe_setup_sdm(priv);
+	if (priv->soc->has_sdm)
+		ralink_fe_setup_sdm(priv);
 
 	return 0;
 
-err_reset:
-	if (priv->rst_fe)
-		reset_control_assert(priv->rst_fe);
 err_clk:
 	clk_disable_unprepare(priv->clk);
 	return err;
@@ -1454,14 +1426,14 @@ static void ralink_fe_remove(struct platform_device *pdev)
 static const struct ralink_fe_soc_data rt5350_data = {
 	.txqs = 4,
 	.rxqs = 2,
-	.needs_sdm = true,
+	.has_sdm = true,
 	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 };
 
 static const struct ralink_fe_soc_data mt7628_data = {
 	.txqs = 4,
 	.rxqs = 2,
-	.needs_sdm = true,
+	.has_sdm = true,
 	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
 };
 
@@ -1476,7 +1448,7 @@ static struct platform_driver ralink_fe_driver = {
 	.probe = ralink_fe_probe,
 	.remove = ralink_fe_remove,
 	.driver = {
-		.name = "ralink_fe",
+		.name = "ralink-fe",
 		.of_match_table = ralink_fe_of_match,
 	},
 };

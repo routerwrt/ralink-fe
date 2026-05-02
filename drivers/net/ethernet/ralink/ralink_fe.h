@@ -69,10 +69,13 @@
 
 /* SDM – Switch DMA glue block */
 
+#define SDM_OFFSET		0x0c00
 /* SDM registers */
-#define SDM_CON			0x0000
-#define SDM_MAC_ADRL		0x000c
-#define SDM_MAC_ADRH		0x0010
+#define SDM_CON			(SDM_OFFSET + 0x0000)
+#define SDM_RRING		(SDM_OFFSET + 0x0004)
+#define SDM_TRING		(SDM_OFFSET + 0x0008)
+#define SDM_MAC_ADRL		(SDM_OFFSET + 0x000c)
+#define SDM_MAC_ADRH		(SDM_OFFSET + 0x0010)
 #define SDM_MAC_ADRH_MASK	GENMASK(15, 0)
 
 #define SDM_PDMA_FC		BIT(23)
@@ -138,7 +141,7 @@ struct ralink_fe_rx_desc {
 struct ralink_fe_soc_data {
 	u8				txqs;
 	u8				rxqs;
-	bool				needs_sdm;
+	bool				has_sdm;
 	u32				pdma_bt_size;
 };
 
