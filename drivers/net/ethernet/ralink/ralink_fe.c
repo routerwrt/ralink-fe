@@ -71,7 +71,7 @@ static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 }
 
 static inline void
-ralink_fe_w32(struct ralink_fe_priv *priv, u32 val, u32 reg)
+ralink_fe_w32(struct ralink_fe_priv *priv, u32 reg, u32 val)
 {
 	writel(val, priv->base + reg);
 }
@@ -82,7 +82,7 @@ static void ralink_fe_irq_enable(struct ralink_fe_priv *priv, u32 mask)
 
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	priv->irq_mask |= mask;
-	ralink_fe_w32(priv, priv->irq_mask, PDMA_INT_ENABLE);
+	ralink_fe_w32(priv, PDMA_INT_ENABLE, priv->irq_mask);
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 }
 
@@ -92,32 +92,32 @@ static void ralink_fe_irq_disable(struct ralink_fe_priv *priv, u32 mask)
 
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	priv->irq_mask &= ~mask;
-	ralink_fe_w32(priv, priv->irq_mask, PDMA_INT_ENABLE);
+	ralink_fe_w32(priv, PDMA_INT_ENABLE, priv->irq_mask);
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 }
 
 static int ralink_fe_dma_disable(struct ralink_fe_priv *priv)
 {
-	u32 v;
+	u32 val;
 
-	v = ralink_fe_r32(priv, PDMA_GLO_CFG);
-	v &= ~(RX_DMA_EN | TX_DMA_EN);
-	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
+	val = ralink_fe_r32(priv, PDMA_GLO_CFG);
+	val &= ~(RX_DMA_EN | TX_DMA_EN);
+	ralink_fe_w32(priv, PDMA_GLO_CFG, val);
 
-	return readl_poll_timeout(priv->base + PDMA_GLO_CFG, v,
-				  !(v & (RX_DMA_BUSY | TX_DMA_BUSY)),
+	return readl_poll_timeout(priv->base + PDMA_GLO_CFG, val,
+				  !(val & (RX_DMA_BUSY | TX_DMA_BUSY)),
 				  1000, 200000);
 }
 
 static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 {
-	u32 v;
+	u32 val;
 
 	/* keep core simple: no delay IRQ/coalesce */
-	ralink_fe_w32(priv, 0, PDMA_DLY_INT_CFG);
+	ralink_fe_w32(priv, PDMA_DLY_INT_CFG, 0);
 
-	v = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
-	ralink_fe_w32(priv, v, PDMA_GLO_CFG);
+	val = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
+	ralink_fe_w32(priv, PDMA_GLO_CFG, val);
 }
 
 static inline void ralink_fe_txq_error(struct ralink_fe_priv *priv, int q)
@@ -156,8 +156,8 @@ ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 	lo = ((u32)mac[2] << 24) | ((u32)mac[3] << 16) |
 	     ((u32)mac[4] << 8) | mac[5];
 
-	ralink_fe_w32(priv, hi, SDM_MAC_ADRH);
-	ralink_fe_w32(priv, lo, SDM_MAC_ADRL);
+	ralink_fe_w32(priv, SDM_MAC_ADRH, hi);
+	ralink_fe_w32(priv, SDM_MAC_ADRL, lo);
 }
 
 static void ralink_fe_rx_release_ring(struct ralink_fe_priv *priv, int q)
@@ -233,28 +233,30 @@ static void ralink_fe_program_rings(struct ralink_fe_priv *priv)
 	int q;
 
 	/* Default PDMA TX scheduler: WRR with equal weights. */
-	ralink_fe_w32(priv, PDMA_SCH_MODE(PDMA_SCH_MODE_WRR), PDMA_SCH);
-	ralink_fe_w32(priv, PDMA_WRR_WT_Q0(1) | PDMA_WRR_WT_Q1(1) |
-			    PDMA_WRR_WT_Q2(1) | PDMA_WRR_WT_Q3(1), PDMA_WRR);
+	ralink_fe_w32(priv, PDMA_SCH, PDMA_SCH_MODE(PDMA_SCH_MODE_WRR));
+	ralink_fe_w32(priv, PDMA_WRR, PDMA_WRR_WT_Q0(1) | PDMA_WRR_WT_Q1(1) |
+				PDMA_WRR_WT_Q2(1) | PDMA_WRR_WT_Q3(1));
 
 	for (q = 0; q < priv->txqs; q++) {
 		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
 
 		ralink_fe_tx_ring_init(priv, q);
-		ralink_fe_w32(priv, ring->desc_dma, ralink_fe_tx_base_ptr(q));
-		ralink_fe_w32(priv, RALINK_FE_TX_RING_SIZE, ralink_fe_tx_max_cnt(q));
-		ralink_fe_w32(priv, ralink_fe_tx_irq_bit(q), PDMA_RST_CFG);
-		ralink_fe_w32(priv, 0, ralink_fe_tx_ctx_idx(q));
+		ralink_fe_w32(priv, ralink_fe_tx_base_ptr(q), ring->desc_dma);
+		ralink_fe_w32(priv, ralink_fe_tx_max_cnt(q), RALINK_FE_TX_RING_SIZE);
+		ralink_fe_w32(priv, PDMA_RST_CFG, ralink_fe_tx_irq_bit(q));
+		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), 0);
 	}
 
 	for (q = 0; q < priv->rxqs; q++) {
 		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
 		ring->cpu_idx = RALINK_FE_RX_RING_SIZE - 1;
-		ralink_fe_w32(priv, ring->desc_dma, ralink_fe_rx_base_ptr(q));
-		ralink_fe_w32(priv, RALINK_FE_RX_RING_SIZE, ralink_fe_rx_max_cnt(q));
-		ralink_fe_w32(priv, ralink_fe_rx_irq_bit(q), PDMA_RST_CFG);
-		ralink_fe_w32(priv, RALINK_FE_RX_RING_SIZE - 1, ralink_fe_rx_ctx_idx(q));
+		ralink_fe_w32(priv, ralink_fe_rx_base_ptr(q), ring->desc_dma);
+		ralink_fe_w32(priv, ralink_fe_rx_max_cnt(q),
+						RALINK_FE_RX_RING_SIZE);
+		ralink_fe_w32(priv, PDMA_RST_CFG, ralink_fe_rx_irq_bit(q));
+		ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(q),
+						RALINK_FE_RX_RING_SIZE - 1);
 	}
 }
 
@@ -291,7 +293,7 @@ static void ralink_fe_rx_ring_publish(struct ralink_fe_priv *priv, int q)
 {
 	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
-	ralink_fe_w32(priv, ring->cpu_idx, ralink_fe_rx_ctx_idx(q));
+	ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(q), ring->cpu_idx);
 }
 
 static void ralink_fe_napi_enable(struct ralink_fe_priv *priv)
@@ -324,7 +326,7 @@ static int ralink_fe_open(struct net_device *ndev)
 
 	ralink_fe_napi_enable(priv);
 
-	ralink_fe_w32(priv, 0xffffffff, PDMA_INT_STATUS);
+	ralink_fe_w32(priv, PDMA_INT_STATUS, 0xffffffff);
 
 	ralink_fe_dma_enable(priv);
 	ralink_fe_irq_enable(priv, priv->irq_mask_all);
@@ -378,7 +380,7 @@ static int ralink_fe_stop(struct net_device *ndev)
 
 		ring->cpu_idx = 0;
 		ring->clean_idx = 0;
-		ralink_fe_w32(priv, 0, ralink_fe_tx_ctx_idx(q));
+		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), 0);
 	}
 
 	for (q = 0; q < priv->rxqs; q++)
@@ -534,7 +536,7 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	netdev_tx_sent_queue(txq, skb->len);
 
 	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
-		ralink_fe_w32(priv, new_cpu, ralink_fe_tx_ctx_idx(q));
+		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), new_cpu);
 
 	return NETDEV_TX_OK;
 
@@ -663,7 +665,7 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	netdev_tx_sent_queue(txq, skb->len);
 
 	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
-		ralink_fe_w32(priv, new_cpu, ralink_fe_tx_ctx_idx(q));
+		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), new_cpu);
 
 	return NETDEV_TX_OK;
 
@@ -921,8 +923,8 @@ static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
 
 		for (i = 0; i < priv->rxqs; i++) {
 			if (mmio_mask & BIT(i))
-				ralink_fe_w32(priv, priv->rx_ring[i].cpu_idx,
-					      ralink_fe_rx_ctx_idx(i));
+				ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(i),
+						priv->rx_ring[i].cpu_idx);
 		}
 	}
 
@@ -955,7 +957,7 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 		return IRQ_NONE;
 
 	ralink_fe_irq_disable(priv, st);
-	ralink_fe_w32(priv, st, PDMA_INT_STATUS);
+	ralink_fe_w32(priv, PDMA_INT_STATUS, st);
 
 	for (q = 0; q < nq; q++) {
 		if (q < priv->rxqs && (st & ralink_fe_rx_irq_bit(q))) {
@@ -967,7 +969,6 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi)) {
 				__napi_schedule(&priv->tx_ring[q].napi.napi);
 				ret = IRQ_HANDLED;
-			}
 		}
 	}
 
@@ -1190,15 +1191,15 @@ static void ralink_fe_cleanup_page_pools(struct ralink_fe_priv *priv)
 
 static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 {
-	u32 v;
+	u32 val;
 
-	v = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
+	val = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
 
-	ralink_fe_w32(priv, v, SDM_CON);
+	ralink_fe_w32(priv, SDM_CON, val);
 	/* priority tag 2 -> RX ring 1 */
-	ralink_fe_w32(priv, BIT(2), SDM_RRING);
+	ralink_fe_w32(priv, SDM_RRING, BIT(2));
 	/* no TX ring pause/FC */
-	ralink_fe_w32(priv, 0, SDM_TRING);
+	ralink_fe_w32(priv, SDM_TRING, 0);
 }
 
 static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
@@ -1387,8 +1388,8 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->irq_lock);
 
 	ralink_fe_dma_disable(priv);
-	ralink_fe_w32(priv, 0xffffffff, PDMA_INT_STATUS);
-	ralink_fe_w32(priv, 0, PDMA_INT_ENABLE);
+	ralink_fe_w32(priv, PDMA_INT_STATUS, 0xffffffff);
+	ralink_fe_w32(priv, PDMA_INT_ENABLE, 0);
 
 	err = devm_request_irq(dev, priv->irq, ralink_fe_irq, 0,
 			       dev_name(dev), priv);
