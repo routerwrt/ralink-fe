@@ -10,71 +10,218 @@
 #include <linux/if_vlan.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_mdio.h>
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
+#include <linux/phylink.h>
 #include <linux/reset.h>
 #include <linux/string.h>
 #include <linux/u64_stats_sync.h>
 
 #include <net/dsa.h>
+#include <net/dst_metadata.h>
 #include <net/page_pool/helpers.h>
 
 #include "ralink_fe.h"
+#include "ra_ppe.h"
+#include "ra_ppe_offload.h"
+#include "ra_ppe_regs.h"
 
-static inline u32 ralink_fe_rx_irq_bit(int q)
-{
-	return BIT(16 + q);
-}
-
-static inline u32 ralink_fe_tx_irq_bit(int q)
-{
-	return BIT(q);
-}
-
-static inline u32 ralink_fe_tx_base_ptr(int q)
-{
-	return TX_BASE_PTR0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_tx_max_cnt(int q)
-{
-	return TX_MAX_CNT0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_tx_ctx_idx(int q)
-{
-	return TX_CTX_IDX0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_tx_dtx_idx(int q)
-{
-	return TX_DTX_IDX0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_rx_base_ptr(int q)
-{
-	return RX_BASE_PTR0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_rx_max_cnt(int q)
-{
-	return RX_MAX_CNT0 + q * 0x10;
-}
-
-static inline u32 ralink_fe_rx_ctx_idx(int q)
-{
-	return RX_CTX_IDX0 + q * 0x10;
-}
-static inline u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
+static u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 {
 	return readl(priv->base + reg);
 }
 
-static inline void
-ralink_fe_w32(struct ralink_fe_priv *priv, u32 reg, u32 val)
+static void ralink_fe_w32(struct ralink_fe_priv *priv, u32 reg, u32 val)
 {
 	writel(val, priv->base + reg);
 }
+
+static int ralink_fe_mdio_wait(struct ralink_fe_priv *priv, u32 *val)
+{
+	return readl_poll_timeout(priv->base + FE_MDIO_ACCESS, *val,
+				  !(*val & FE_MDIO_CMD_TRG),
+				  1, RALINK_FE_MDIO_TIMEOUT_US);
+}
+
+static int ralink_fe_mdio_read(struct mii_bus *bus, int phy, int reg)
+{
+	struct ralink_fe_priv *priv = bus->priv;
+	u32 cmd, val;
+	int ret;
+
+	mutex_lock(&priv->mdio_lock);
+
+	ret = ralink_fe_mdio_wait(priv, &val);
+	if (ret)
+		goto out;
+
+	cmd = FIELD_PREP(FE_MDIO_PHY_ADDR, phy) |
+	      FIELD_PREP(FE_MDIO_REG_ADDR, reg);
+
+	/*
+	 * Preserve the known working RT2880 sequence:
+	 * program command first, then assert CMD_TRG.
+	 */
+	ralink_fe_w32(priv, FE_MDIO_ACCESS, cmd);
+	ralink_fe_w32(priv, FE_MDIO_ACCESS, cmd | FE_MDIO_CMD_TRG);
+
+	ret = ralink_fe_mdio_wait(priv, &val);
+
+out:
+	mutex_unlock(&priv->mdio_lock);
+
+	if (ret)
+		return ret;
+
+	return FIELD_GET(FE_MDIO_DATA, val);
+}
+
+static int ralink_fe_mdio_write(struct mii_bus *bus, int phy,
+				int reg, u16 data)
+{
+	struct ralink_fe_priv *priv = bus->priv;
+	u32 cmd, val;
+	int ret;
+
+	mutex_lock(&priv->mdio_lock);
+
+	ret = ralink_fe_mdio_wait(priv, &val);
+	if (ret)
+		goto out;
+
+	cmd = FE_MDIO_WRITE |
+	      FIELD_PREP(FE_MDIO_PHY_ADDR, phy) |
+	      FIELD_PREP(FE_MDIO_REG_ADDR, reg) |
+	      FIELD_PREP(FE_MDIO_DATA, data);
+
+	ralink_fe_w32(priv, FE_MDIO_ACCESS, cmd);
+	ralink_fe_w32(priv, FE_MDIO_ACCESS, cmd | FE_MDIO_CMD_TRG);
+
+	ret = ralink_fe_mdio_wait(priv, &val);
+
+out:
+	mutex_unlock(&priv->mdio_lock);
+
+	return ret;
+}
+
+static int ralink_fe_mdio_register(struct ralink_fe_priv *priv)
+{
+	struct device_node *mdio_np;
+	struct mii_bus *bus;
+	int ret;
+
+	mdio_np = of_get_available_child_by_name(priv->dev->of_node, "mdio");
+	if (!mdio_np)
+		mdio_np = of_get_available_child_by_name(priv->dev->of_node,
+							 "mdio-bus");
+	if (!mdio_np)
+		return 0;
+
+	bus = devm_mdiobus_alloc(priv->dev);
+	if (!bus) {
+		of_node_put(mdio_np);
+		return -ENOMEM;
+	}
+
+	bus->name = "ralink-fe-mdio";
+	bus->read = ralink_fe_mdio_read;
+	bus->write = ralink_fe_mdio_write;
+	bus->parent = priv->dev;
+	bus->priv = priv;
+
+	snprintf(bus->id, MII_BUS_ID_SIZE, "%s-mdio",
+		 dev_name(priv->dev));
+
+	ret = devm_of_mdiobus_register(priv->dev, bus, mdio_np);
+	of_node_put(mdio_np);
+	if (ret)
+		return dev_err_probe(priv->dev, ret,
+				     "failed to register FE MDIO bus\n");
+
+	priv->mii_bus = bus;
+
+	return 0;
+}
+
+static void
+ralink_fe_mac_config(struct phylink_config *config, unsigned int mode,
+		     const struct phylink_link_state *state)
+{
+	/* Interface mux/pin setup is SoC/board setup; nothing needed here yet. */
+}
+
+static void
+ralink_fe_mac_link_down(struct phylink_config *config, unsigned int mode,
+			phy_interface_t interface)
+{
+	/*
+	 * The old RT2880 driver only changed software carrier state on
+	 * link-down. Phylink owns carrier now, so nothing to do here.
+	 */
+}
+
+static void
+ralink_fe_mac_link_up(struct phylink_config *config,
+		      struct phy_device *phydev, unsigned int mode,
+		      phy_interface_t interface, int speed, int duplex,
+		      bool tx_pause, bool rx_pause)
+{
+	struct ralink_fe_priv *priv =
+		container_of(config, struct ralink_fe_priv, phylink_config);
+	u32 mask, val;
+
+	mask = FE_MDIO_CFG_GP1_AUTO_POLL |
+	       FE_MDIO_CFG_GP1_FRC_EN |
+	       FE_MDIO_CFG_GP1_SPEED |
+	       FE_MDIO_CFG_GP1_DUPLEX |
+	       FE_MDIO_CFG_GP1_FC_TX |
+	       FE_MDIO_CFG_GP1_FC_RX;
+
+	val = FE_MDIO_CFG_GP1_FRC_EN;
+
+	switch (speed) {
+	case SPEED_1000:
+		val |= FIELD_PREP(FE_MDIO_CFG_GP1_SPEED,
+				  FE_MDIO_CFG_GP1_SPEED_1000);
+		break;
+	case SPEED_100:
+		val |= FIELD_PREP(FE_MDIO_CFG_GP1_SPEED,
+				  FE_MDIO_CFG_GP1_SPEED_100);
+		break;
+	case SPEED_10:
+		val |= FIELD_PREP(FE_MDIO_CFG_GP1_SPEED,
+				  FE_MDIO_CFG_GP1_SPEED_10);
+		break;
+	default:
+		return;
+	}
+
+	if (duplex == DUPLEX_FULL)
+		val |= FE_MDIO_CFG_GP1_DUPLEX;
+
+	if (tx_pause)
+		val |= FE_MDIO_CFG_GP1_FC_TX;
+
+	if (rx_pause)
+		val |= FE_MDIO_CFG_GP1_FC_RX;
+
+	/*
+	 * Do not touch the low clock/skew bits yet. This preserves the
+	 * boot/pin setup while phylink owns speed/duplex/pause.
+	 *
+	 * AUTO_POLL is deliberately cleared: Linux/phylink owns PHY state.
+	 */
+	ralink_fe_w32(priv, FE_MDIO_CFG,
+		      (ralink_fe_r32(priv, FE_MDIO_CFG) & ~mask) | val);
+}
+
+static const struct phylink_mac_ops ralink_fe_phylink_mac_ops = {
+	.mac_config	= ralink_fe_mac_config,
+	.mac_link_down	= ralink_fe_mac_link_down,
+	.mac_link_up	= ralink_fe_mac_link_up,
+};
 
 static void ralink_fe_irq_enable(struct ralink_fe_priv *priv, u32 mask)
 {
@@ -82,7 +229,7 @@ static void ralink_fe_irq_enable(struct ralink_fe_priv *priv, u32 mask)
 
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	priv->irq_mask |= mask;
-	ralink_fe_w32(priv, PDMA_INT_ENABLE, priv->irq_mask);
+	writel(priv->irq_mask, priv->int_enable);
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 }
 
@@ -92,19 +239,20 @@ static void ralink_fe_irq_disable(struct ralink_fe_priv *priv, u32 mask)
 
 	spin_lock_irqsave(&priv->irq_lock, flags);
 	priv->irq_mask &= ~mask;
-	ralink_fe_w32(priv, PDMA_INT_ENABLE, priv->irq_mask);
+	writel(priv->irq_mask, priv->int_enable);
 	spin_unlock_irqrestore(&priv->irq_lock, flags);
 }
 
 static int ralink_fe_dma_disable(struct ralink_fe_priv *priv)
 {
 	u32 val;
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
 
-	val = ralink_fe_r32(priv, PDMA_GLO_CFG);
+	val = ralink_fe_r32(priv, pdma->glo_cfg);
 	val &= ~(RX_DMA_EN | TX_DMA_EN);
-	ralink_fe_w32(priv, PDMA_GLO_CFG, val);
+	ralink_fe_w32(priv, pdma->glo_cfg, val);
 
-	return readl_poll_timeout(priv->base + PDMA_GLO_CFG, val,
+	return readl_poll_timeout(priv->base + pdma->glo_cfg, val,
 				  !(val & (RX_DMA_BUSY | TX_DMA_BUSY)),
 				  1000, 200000);
 }
@@ -112,12 +260,24 @@ static int ralink_fe_dma_disable(struct ralink_fe_priv *priv)
 static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 {
 	u32 val;
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
 
-	/* keep core simple: no delay IRQ/coalesce */
-	ralink_fe_w32(priv, PDMA_DLY_INT_CFG, 0);
+	ralink_fe_w32(priv, pdma->dly_int_cfg, 0);
 
-	val = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
-	ralink_fe_w32(priv, PDMA_GLO_CFG, val);
+//	val = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
+	val = RX_2B_OFFSET | RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
+
+	ralink_fe_w32(priv, pdma->glo_cfg, val);
+}
+
+static bool ralink_uses_dsa(struct net_device *dev)
+{
+#if IS_ENABLED(CONFIG_NET_DSA)
+	return netdev_uses_dsa(dev) &&
+	       dev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RALINK;
+#else
+	return false;
+#endif
 }
 
 static inline void ralink_fe_txq_error(struct ralink_fe_priv *priv, int q)
@@ -147,17 +307,16 @@ static inline void ralink_fe_txq_drop(struct ralink_fe_priv *priv, int q)
 	u64_stats_update_end(&ring->syncp);
 }
 
-static void
-ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
+static void ralink_fe_hw_set_mac(struct ralink_fe_priv *priv, const u8 *mac)
 {
-	u32 lo, hi;
+	u32 hi, lo;
 
 	hi = ((u32)mac[0] << 8) | mac[1];
 	lo = ((u32)mac[2] << 24) | ((u32)mac[3] << 16) |
 	     ((u32)mac[4] << 8) | mac[5];
 
-	ralink_fe_w32(priv, SDM_MAC_ADRH, hi);
-	ralink_fe_w32(priv, SDM_MAC_ADRL, lo);
+	ralink_fe_w32(priv, priv->soc->mac_adr_h, hi);
+	ralink_fe_w32(priv, priv->soc->mac_adr_l, lo);
 }
 
 static void ralink_fe_rx_release_ring(struct ralink_fe_priv *priv, int q)
@@ -231,32 +390,27 @@ static void ralink_fe_tx_ring_init(struct ralink_fe_priv *priv, int q)
 static void ralink_fe_program_rings(struct ralink_fe_priv *priv)
 {
 	int q;
-
-	/* Default PDMA TX scheduler: WRR with equal weights. */
-	ralink_fe_w32(priv, PDMA_SCH, PDMA_SCH_MODE(PDMA_SCH_MODE_WRR));
-	ralink_fe_w32(priv, PDMA_WRR, PDMA_WRR_WT_Q0(1) | PDMA_WRR_WT_Q1(1) |
-				PDMA_WRR_WT_Q2(1) | PDMA_WRR_WT_Q3(1));
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
 
 	for (q = 0; q < priv->txqs; q++) {
 		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
 
 		ralink_fe_tx_ring_init(priv, q);
-		ralink_fe_w32(priv, ralink_fe_tx_base_ptr(q), ring->desc_dma);
-		ralink_fe_w32(priv, ralink_fe_tx_max_cnt(q), RALINK_FE_TX_RING_SIZE);
-		ralink_fe_w32(priv, PDMA_RST_CFG, ralink_fe_tx_irq_bit(q));
-		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), 0);
+		ralink_fe_w32(priv, pdma->tx_base_ptr[q], ring->desc_dma);
+		ralink_fe_w32(priv, pdma->tx_max_cnt[q], RALINK_FE_TX_RING_SIZE);
+		ralink_fe_w32(priv, pdma->rst_idx, tx_rst[q]);
+		writel(0, priv->tx_cpu_idx[q]);
 	}
 
 	for (q = 0; q < priv->rxqs; q++) {
 		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
 		ring->cpu_idx = RALINK_FE_RX_RING_SIZE - 1;
-		ralink_fe_w32(priv, ralink_fe_rx_base_ptr(q), ring->desc_dma);
-		ralink_fe_w32(priv, ralink_fe_rx_max_cnt(q),
+		ralink_fe_w32(priv, pdma->rx_base_ptr[q], ring->desc_dma);
+		ralink_fe_w32(priv, pdma->rx_max_cnt[q],
 						RALINK_FE_RX_RING_SIZE);
-		ralink_fe_w32(priv, PDMA_RST_CFG, ralink_fe_rx_irq_bit(q));
-		ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(q),
-						RALINK_FE_RX_RING_SIZE - 1);
+		ralink_fe_w32(priv, pdma->rst_idx, rx_rst[q]);
+		writel(ring->cpu_idx, priv->rx_cpu_idx[q]);
 	}
 }
 
@@ -281,19 +435,15 @@ static int ralink_fe_rx_ring_refill(struct ralink_fe_priv *priv, int q)
 		b->dma = dma;
 
 		d->info1 = (u32)(dma + RALINK_FE_RX_HEADROOM_BYTES);
+		d->info3 = 0;
+		d->info4 = 0;
 		WRITE_ONCE(d->info2, RX2_DMA_LS0);
 	}
+	dma_wmb();
 
 	ring->cpu_idx = RALINK_FE_RX_RING_SIZE - 1;
 
 	return 0;
-}
-
-static void ralink_fe_rx_ring_publish(struct ralink_fe_priv *priv, int q)
-{
-	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
-
-	ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(q), ring->cpu_idx);
 }
 
 static void ralink_fe_napi_enable(struct ralink_fe_priv *priv)
@@ -309,7 +459,8 @@ static void ralink_fe_napi_enable(struct ralink_fe_priv *priv)
 static int ralink_fe_open(struct net_device *ndev)
 {
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
-	int q, err;
+	int q, i, err;
+	bool use_dsa = false;
 
 	for (q = 0; q < priv->rxqs; q++) {
 		err = ralink_fe_rx_ring_refill(priv, q);
@@ -319,19 +470,43 @@ static int ralink_fe_open(struct net_device *ndev)
 
 	ralink_fe_program_rings(priv);
 
-	for (q = 0; q < priv->rxqs; q++)
-		ralink_fe_rx_ring_publish(priv, q);
+	if (priv->soc->dsa_use_oob)
+		use_dsa = ralink_uses_dsa(ndev);
+
+	priv->dsa_use_oob = use_dsa;
+
+	if (priv->dsa_use_oob) {
+		for (i = 0; i < ARRAY_SIZE(priv->dsa_meta); i++) {
+			struct metadata_dst *md_dst = priv->dsa_meta[i];
+
+			if (md_dst)
+				continue;
+
+			md_dst = metadata_dst_alloc(0, METADATA_HW_PORT_MUX,
+						    GFP_KERNEL);
+			if (!md_dst)
+				return -ENOMEM;
+
+			md_dst->u.port_info.port_id = i;
+			priv->dsa_meta[i] = md_dst;
+		}
+	}
 
 	priv->irq_mask = 0;
 
 	ralink_fe_napi_enable(priv);
 
-	ralink_fe_w32(priv, PDMA_INT_STATUS, 0xffffffff);
+	writel(0xffffffff, priv->int_status);
 
 	ralink_fe_dma_enable(priv);
+
 	ralink_fe_irq_enable(priv, priv->irq_mask_all);
 
-	netif_carrier_on(ndev);
+	if (priv->phylink)
+		phylink_start(priv->phylink);
+	else
+		netif_carrier_on(ndev);
+
 	netif_tx_start_all_queues(ndev);
 
 	return 0;
@@ -380,13 +555,16 @@ static int ralink_fe_stop(struct net_device *ndev)
 
 		ring->cpu_idx = 0;
 		ring->clean_idx = 0;
-		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), 0);
+		writel(0, priv->tx_cpu_idx[q]);
 	}
 
 	for (q = 0; q < priv->rxqs; q++)
 		ralink_fe_rx_release_ring(priv, q);
 
-	netif_carrier_off(ndev);
+	if (priv->phylink)
+		phylink_stop(priv->phylink);
+	else
+		netif_carrier_off(ndev);
 
 	return 0;
 }
@@ -402,8 +580,7 @@ ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
 	int pkts = 0;
 	u32 bytes = 0;
 
-	dtx = (ralink_fe_r32(priv, ralink_fe_tx_dtx_idx(q)) & 0x0fff) &
-	      RALINK_FE_TX_RING_MASK;
+	dtx = (readl(priv->tx_dma_idx[q]) & 0x0fff) & RALINK_FE_TX_RING_MASK;
 	dma_rmb();
 
 	while (clean != dtx && pkts < budget) {
@@ -444,7 +621,7 @@ ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
 
 	if (pkts < budget) {
 		if (napi_complete_done(&ring->napi.napi, pkts))
-			ralink_fe_irq_enable(priv, ralink_fe_tx_irq_bit(q));
+			ralink_fe_irq_enable(priv, priv->tx_irq[q]);
 	}
 
 	return pkts;
@@ -491,6 +668,10 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	dma_addr_t dma;
 	u16 len;
 	u32 desc_info2;
+	u32 txinfo = 0;
+	int pn = (q & BIT(1)) ? 2 : 1;
+	int qn = (q & BIT(0)) ? 3 : 2;
+	int port = skb_get_queue_mapping(skb);
 
 	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
 		RALINK_FE_TX_RING_MASK;
@@ -500,13 +681,13 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 		return NETDEV_TX_BUSY;
 	}
 
-	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
-		if (skb_checksum_help(skb)) {
-			ralink_fe_txq_drop(priv, q);
-			dev_kfree_skb_any(skb);
-			return NETDEV_TX_OK;
-		}
-	}
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		txinfo = TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
+
+	if (priv->soc->tx4_port == RA_TX4_PNQN)
+		txinfo |= TX4_DMA_PN(pn) | TX4_DMA_QN(qn);
+	if (priv->soc->tx4_port == RA_TX4_FP)
+		txinfo |= TX4_DMA_FP(BIT(port));
 
 	if (skb_put_padto(skb, ETH_ZLEN)) {
 		ralink_fe_txq_drop(priv, q);
@@ -526,7 +707,8 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 
 	d->info1 = (u32)dma;
 	d->info3 = 0;
-	d->info4 = 0;
+	d->info4 = txinfo;
+
 	dma_wmb();
 	WRITE_ONCE(d->info2, desc_info2);
 
@@ -536,7 +718,7 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	netdev_tx_sent_queue(txq, skb->len);
 
 	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
-		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), new_cpu);
+		writel(new_cpu, priv->tx_cpu_idx[q]);
 
 	return NETDEV_TX_OK;
 
@@ -565,6 +747,10 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	int segs = 1 + nr_frags;
 	int needed_desc = (segs + 1) >> 1;
 	int i, fidx;
+	u32 txinfo = 0;
+	int pn = (q & BIT(1)) ? 2 : 1;
+	int qn = (q & BIT(0)) ? 3 : 2;
+	int port = skb_get_queue_mapping(skb);
 
 	/*
 	 * PDMA supports scatter-gather TX. Each descriptor carries up to
@@ -578,13 +764,13 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 		return NETDEV_TX_BUSY;
 	}
 
-	if (unlikely(skb->ip_summed == CHECKSUM_PARTIAL)) {
-		if (skb_checksum_help(skb)) {
-			ralink_fe_txq_drop(priv, q);
-			dev_kfree_skb_any(skb);
-			return NETDEV_TX_OK;
-		}
-	}
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		txinfo |= TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
+
+	if (priv->soc->tx4_port == RA_TX4_PNQN)
+		txinfo |= TX4_DMA_PN(pn) | TX4_DMA_QN(qn);
+	if (priv->soc->tx4_port == RA_TX4_FP)
+		txinfo |= TX4_DMA_FP(BIT(port));
 
 	if (skb_put_padto(skb, ETH_ZLEN)) {
 		ralink_fe_txq_drop(priv, q);
@@ -611,7 +797,7 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 
 		d->info1 = (u32)dma;
 		d->info3 = 0;
-		d->info4 = 0;
+		d->info4 = txinfo;
 		info2[0] = TX2_DMA_SDL0(len);
 	}
 
@@ -644,6 +830,7 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 			if (last)
 				info2[didx_off] |= TX2_DMA_LS0;
 		}
+		d->info4 = txinfo;
 
 		if (last)
 			last_didx = didx;
@@ -665,7 +852,7 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	netdev_tx_sent_queue(txq, skb->len);
 
 	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
-		ralink_fe_w32(priv, ralink_fe_tx_ctx_idx(q), new_cpu);
+		writel(new_cpu, priv->tx_cpu_idx[q]);
 
 	return NETDEV_TX_OK;
 
@@ -693,7 +880,8 @@ static netdev_tx_t ralink_fe_start_xmit(struct sk_buff *skb,
 	struct netdev_queue *txq;
 	int q;
 
-	q = skb_get_queue_mapping(skb);
+	q = (skb_get_queue_mapping(skb) & 0x3);
+
 	if (unlikely(q >= priv->txqs))
 		q = 0;
 
@@ -714,18 +902,10 @@ static u16
 ralink_fe_select_queue(struct net_device *ndev, struct sk_buff *skb,
 				  struct net_device *sb_dev)
 {
-	struct ralink_fe_priv *priv = netdev_priv(ndev);
-	int queue;
-
 	if (likely(netdev_uses_dsa(ndev)))
-		queue = skb_get_queue_mapping(skb);
-	else
-		queue = netdev_pick_tx(ndev, skb, sb_dev);
-
-	if (unlikely(queue >= priv->txqs))
-		queue = 0;
-
-	return queue;
+		return skb_get_queue_mapping(skb);
+	/* fallback to default behavior */
+	return netdev_pick_tx(ndev, skb, sb_dev);
 }
 
 static int ralink_fe_set_mac_addr(struct net_device *ndev, void *p)
@@ -784,6 +964,23 @@ static void ralink_fe_get_stats64(struct net_device *ndev,
 	}
 }
 
+static int ralink_fe_setup_tc(struct net_device *dev,
+			      enum tc_setup_type type, void *type_data)
+{
+	struct ralink_fe_priv *priv = netdev_priv(dev);
+
+	if (!priv->ppe)
+		return -EOPNOTSUPP;
+
+	switch (type) {
+	case TC_SETUP_BLOCK:
+	case TC_SETUP_FT:
+		return ra_ppe_setup_tc_block(priv->ppe, dev, type_data);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_open		= ralink_fe_open,
 	.ndo_stop		= ralink_fe_stop,
@@ -792,31 +989,30 @@ static const struct net_device_ops ralink_fe_netdev_ops = {
 	.ndo_set_mac_address	= ralink_fe_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_get_stats64	= ralink_fe_get_stats64,
+	.ndo_setup_tc		= ralink_fe_setup_tc,
 };
 
-static inline
-int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
-					   u32 *bytes)
+static inline int
+ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 {
 	struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
-	struct net_device *ndev = priv->ndev;
+	const struct ralink_fe_soc_data *soc = priv->soc;
 	u16 cpu = (ring->cpu_idx + 1) & RALINK_FE_RX_RING_MASK;
 	struct ralink_fe_rx_desc *d = &ring->desc[cpu];
 	struct ralink_fe_rx_buf *b = &ring->buf[cpu];
 	struct sk_buff *skb;
 	struct page *page;
 	dma_addr_t dma;
-	u32 info2, rxsum, len;
+	u32 rxinfo2, rxinfo4, len;
+	int ret = 0;
 
-	*bytes = 0;
-
-	info2 = READ_ONCE(d->info2);
-	if (!(info2 & RX2_DMA_DONE))
-		return 0;
+	rxinfo2 = READ_ONCE(d->info2);
+	if (!(rxinfo2 & RX2_DMA_DONE))
+		return -1;
 
 	dma_rmb();
-	rxsum = READ_ONCE(d->info4);
-	len = RX2_DMA_SDL0_GET(info2);
+	rxinfo4 = READ_ONCE(d->info4);
+	len = RX2_DMA_SDL0_GET(rxinfo2);
 
 	page = page_pool_dev_alloc_pages(ring->pp);
 	if (unlikely(!page)) {
@@ -845,91 +1041,171 @@ int ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q,
 	skb_reserve(skb, RALINK_FE_RX_HEADROOM_BYTES);
 	skb_put(skb, len);
 
-	if ((rxsum & RX4_DMA_L4FVLD) &&
-	    !(rxsum & RX4_DMA_L4F) &&
-	    !(rxsum & RX4_DMA_IPF))
+	if ((rxinfo4 & soc->rx_csum_valid) == soc->rx_csum_valid &&
+	    !(rxinfo4 & soc->rx_csum_clear))
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	else
 		skb_checksum_none_assert(skb);
 
-	skb->protocol = eth_type_trans(skb, ndev);
+	skb->protocol = eth_type_trans(skb, priv->ndev);
+
+	if (priv->dsa_use_oob) {
+		unsigned int port = MT7620_DMA_SP_GET(rxinfo4);
+
+		if (port < ARRAY_SIZE(priv->dsa_meta) && priv->dsa_meta[port])
+			skb_dst_set_noref(skb, &priv->dsa_meta[port]->dst);
+	}
+
+	if ((soc->ppe == RA_PPE_V1) && (rxinfo4 & RX4_DMA_AIS)) {
+		u8 reason = RX4_DMA_AI_GET(rxinfo4);
+		u16 foe = RX4_DMA_FOE_GET(rxinfo4);
+
+		if (reason == RA_PPE_REASON_HIT_UNBIND_RATE_REACH) {
+			if (ra_ppe_offload_check(priv->ppe, foe, false)) {
+				dev_kfree_skb_any(skb);
+				goto rx_rearm;
+			}
+		} else if (reason == RA_PPE_REASON_HIT_BIND_KEEPALIVE) {
+			ra_ppe_offload_check(priv->ppe, foe, true);
+			dev_kfree_skb_any(skb);
+			goto rx_rearm;
+		}
+	}
+
 	skb_record_rx_queue(skb, q);
 	napi_gro_receive(&priv->rx_napi_all, skb);
 
-	*bytes = len;
+	ret = len;
 
 rx_rearm:
 	b->page = page;
 	b->dma = dma;
 
 	d->info1 = (u32)(dma + RALINK_FE_RX_HEADROOM_BYTES);
-	/*
-	 * Single-buffer RX descriptor:
-	 * SDP0 points at the receive buffer, LS0 marks it as the
-	 * last/only segment, and DDONE is cleared for device ownership.
-	 */
+	d->info3 = 0;
+	d->info4 = 0;
 	WRITE_ONCE(d->info2, RX2_DMA_LS0);
 
 	ring->cpu_idx = cpu;
-	return 1;
+
+	return ret;
 }
 
-static int ralink_fe_rx_poll_all(struct napi_struct *napi, int budget)
+static int ralink_fe_rx_poll_1q(struct napi_struct *napi, int budget)
 {
 	struct ralink_fe_priv *priv =
 		container_of(napi, struct ralink_fe_priv, rx_napi_all);
-	u32 mmio_mask = 0;
-	u32 rx_pkts[RALINK_FE_MAX_RXQ] = {};
-	u32 rx_bytes[RALINK_FE_MAX_RXQ] = {};
+	struct ralink_fe_rx_ring *ring = &priv->rx_ring[0];
+	u32 rx_pkts = 0;
+	u32 rx_bytes = 0;
 	int work_done = 0;
-	int q = 0;
-	int idle = 0;
-	int i;
 
-	while (work_done < budget && idle < priv->rxqs) {
-		u32 bytes;
+	while (work_done < budget) {
+		int bytes;
 
-		if (ralink_fe_rx_consume_one(priv, q, &bytes)) {
-			work_done++;
-			idle = 0;
-			mmio_mask |= BIT(q);
+		bytes = ralink_fe_rx_consume_one(priv, 0);
+		if (bytes < 0)
+			break;
+		work_done++;
+		if (bytes) {
+			rx_pkts++;
+			rx_bytes += bytes;
+		}
+	}
 
-			if (bytes) {
-				rx_pkts[q]++;
-				rx_bytes[q] += bytes;
-			}
-		} else {
-			idle++;
+	if (work_done) {
+		if (rx_pkts) {
+			u64_stats_update_begin(&ring->syncp);
+			ring->packets += rx_pkts;
+			ring->bytes += rx_bytes;
+			u64_stats_update_end(&ring->syncp);
 		}
 
-		if (++q == priv->rxqs)
-			q = 0;
-	}
-
-	for (i = 0; i < priv->rxqs; i++) {
-		struct ralink_fe_rx_ring *ring = &priv->rx_ring[i];
-
-		if (!rx_pkts[i])
-			continue;
-
-		u64_stats_update_begin(&ring->syncp);
-		ring->packets += rx_pkts[i];
-		ring->bytes += rx_bytes[i];
-		u64_stats_update_end(&ring->syncp);
-	}
-
-	if (mmio_mask) {
 		dma_wmb();
-
-		for (i = 0; i < priv->rxqs; i++) {
-			if (mmio_mask & BIT(i))
-				ralink_fe_w32(priv, ralink_fe_rx_ctx_idx(i),
-						priv->rx_ring[i].cpu_idx);
-		}
+		writel(ring->cpu_idx, priv->rx_cpu_idx[0]);
 	}
 
 	if (work_done < budget) {
-		if (napi_complete_done(&priv->rx_napi_all, work_done))
+		if (napi_complete_done(napi, work_done))
+			ralink_fe_irq_enable(priv, priv->rx_irq_mask);
+	}
+
+	return work_done;
+}
+
+static int ralink_fe_rx_poll_2q(struct napi_struct *napi, int budget)
+{
+	struct ralink_fe_priv *priv =
+		container_of(napi, struct ralink_fe_priv, rx_napi_all);
+	struct ralink_fe_rx_ring *ring0 = &priv->rx_ring[0];
+	struct ralink_fe_rx_ring *ring1 = &priv->rx_ring[1];
+	u32 rx_pkts0 = 0, rx_bytes0 = 0;
+	u32 rx_pkts1 = 0, rx_bytes1 = 0;
+	bool touched0 = false;
+	bool touched1 = false;
+	int work_done = 0;
+
+	while (work_done < budget) {
+		bool did_work = false;
+		int bytes;
+
+		bytes = ralink_fe_rx_consume_one(priv, 0);
+		if (bytes >= 0) {
+			work_done++;
+			did_work = true;
+			touched0 = true;
+
+			if (bytes) {
+				rx_pkts0++;
+				rx_bytes0 += bytes;
+			}
+		}
+
+		if (work_done >= budget)
+			break;
+
+		bytes = ralink_fe_rx_consume_one(priv, 1);
+		if (bytes >= 0) {
+			work_done++;
+			did_work = true;
+			touched1 = true;
+
+			if (bytes) {
+				rx_pkts1++;
+				rx_bytes1 += bytes;
+			}
+		}
+
+		if (!did_work)
+			break;
+	}
+
+	if (rx_pkts0) {
+		u64_stats_update_begin(&ring0->syncp);
+		ring0->packets += rx_pkts0;
+		ring0->bytes += rx_bytes0;
+		u64_stats_update_end(&ring0->syncp);
+	}
+
+	if (rx_pkts1) {
+		u64_stats_update_begin(&ring1->syncp);
+		ring1->packets += rx_pkts1;
+		ring1->bytes += rx_bytes1;
+		u64_stats_update_end(&ring1->syncp);
+	}
+
+	if (touched0 || touched1) {
+		dma_wmb();
+
+		if (touched0)
+			writel(ring0->cpu_idx, priv->rx_cpu_idx[0]);
+
+		if (touched1)
+			writel(ring1->cpu_idx, priv->rx_cpu_idx[1]);
+	}
+
+	if (work_done < budget) {
+		if (napi_complete_done(napi, work_done))
 			ralink_fe_irq_enable(priv, priv->rx_irq_mask);
 	}
 
@@ -947,7 +1223,7 @@ static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
 static irqreturn_t ralink_fe_irq(int irq, void *data)
 {
 	struct ralink_fe_priv *priv = data;
-	u32 st = ralink_fe_r32(priv, PDMA_INT_STATUS) & READ_ONCE(priv->irq_mask);
+	u32 st = readl(priv->int_status) & READ_ONCE(priv->irq_mask);
 	irqreturn_t ret = IRQ_NONE;
 	int nq = max_t(int, priv->txqs, priv->rxqs);
 	bool rx = false;
@@ -957,15 +1233,15 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 		return IRQ_NONE;
 
 	ralink_fe_irq_disable(priv, st);
-	ralink_fe_w32(priv, PDMA_INT_STATUS, st);
+	writel(st, priv->int_status);
 
 	for (q = 0; q < nq; q++) {
-		if (q < priv->rxqs && (st & ralink_fe_rx_irq_bit(q))) {
+		if (q < priv->rxqs && (st & priv->rx_irq[q])) {
 			rx = true;
 			ret = IRQ_HANDLED;
 		}
 
-		if (q < priv->txqs && (st & ralink_fe_tx_irq_bit(q))) {
+		if (q < priv->txqs && (st & priv->tx_irq[q])) {
 			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi))
 				__napi_schedule(&priv->tx_ring[q].napi.napi);
 			ret = IRQ_HANDLED;
@@ -1116,7 +1392,13 @@ static void ralink_fe_setup_netdev(struct net_device *ndev,
 	ralink_fe_hw_set_mac(priv, ndev->dev_addr);
 
 	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_SG;
+
+	if (priv->soc->has_tx_csum)
+		ndev->hw_features |= NETIF_F_IP_CSUM;
+	if (priv->soc->ppe != RA_PPE_NONE)
+		ndev->hw_features |= NETIF_F_HW_TC;
 	ndev->features = ndev->hw_features;
+	ndev->vlan_features = ndev->hw_features;
 
 	ndev->max_mtu = RALINK_FE_MAX_DMA_LEN - VLAN_ETH_HLEN;
 	ndev->netdev_ops = &ralink_fe_netdev_ops;
@@ -1191,15 +1473,48 @@ static void ralink_fe_cleanup_page_pools(struct ralink_fe_priv *priv)
 
 static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
 {
-	u32 val;
+//	u32 val;
 
-	val = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
+//	val = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
+//	val &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
+//	ralink_fe_w32(priv, SDM_CON, val);
 
-	ralink_fe_w32(priv, SDM_CON, val);
 	/* priority tag 2 -> RX ring 1 */
 	ralink_fe_w32(priv, SDM_RRING, BIT(2));
 	/* no TX ring pause/FC */
 	ralink_fe_w32(priv, SDM_TRING, 0);
+}
+
+static void ralink_fe_setup_tx_csum_ctrl(struct ralink_fe_priv *priv)
+{
+	u32 val;
+
+	if (!priv->soc->cdm_csg_cfg)
+		return;
+
+	val = ralink_fe_r32(priv, priv->soc->cdm_csg_cfg);
+	if (priv->soc->has_tx_csum)
+		val |= CDM_ICS_GEN_EN | CDM_UCS_GEN_EN | CDM_TCS_GEN_EN;
+	else
+		val &= ~(CDM_ICS_GEN_EN | CDM_UCS_GEN_EN | CDM_TCS_GEN_EN);
+	/* move "wan" to RX1 on MT7620 */
+	if (priv->soc->rxqs > 1)
+		val |= BIT(8);
+
+	ralink_fe_w32(priv, priv->soc->cdm_csg_cfg, val);
+}
+
+static void ralink_fe_setup_rx_csum_ctrl(struct ralink_fe_priv *priv)
+{
+	u32 val;
+
+	if (!priv->soc->rx_csum_ctrl)
+		return;
+
+	val = ralink_fe_r32(priv, priv->soc->rx_csum_ctrl);
+	val |= priv->soc->rx_csum_ctrl_set;
+	val &= ~priv->soc->rx_csum_ctrl_clear;
+	ralink_fe_w32(priv, priv->soc->rx_csum_ctrl, val);
 }
 
 static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
@@ -1207,20 +1522,24 @@ static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
 	int q;
 
 	for (q = 0; q < priv->txqs; q++) {
-		priv->tx_ring[q].desc = dmam_alloc_coherent(priv->dev,
+		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+
+		ring->desc = dmam_alloc_coherent(priv->dev,
 			sizeof(struct ralink_fe_tx_desc) *
 			RALINK_FE_TX_RING_SIZE,
-			&priv->tx_ring[q].desc_dma, GFP_KERNEL);
-		if (!priv->tx_ring[q].desc)
+			&ring->desc_dma, GFP_KERNEL);
+		if (!ring->desc)
 			return -ENOMEM;
 	}
 
 	for (q = 0; q < priv->rxqs; q++) {
-		priv->rx_ring[q].desc = dmam_alloc_coherent(priv->dev,
+		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
+
+		ring->desc = dmam_alloc_coherent(priv->dev,
 			sizeof(struct ralink_fe_rx_desc) *
 			RALINK_FE_RX_RING_SIZE,
-			&priv->rx_ring[q].desc_dma, GFP_KERNEL);
-		if (!priv->rx_ring[q].desc)
+			&ring->desc_dma, GFP_KERNEL);
+		if (!ring->desc)
 			return -ENOMEM;
 	}
 
@@ -1238,14 +1557,14 @@ static int ralink_fe_init_queues(struct net_device *ndev,
 	for (q = 0; q < priv->rxqs; q++) {
 		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
 
-		priv->rx_irq_mask |= ralink_fe_rx_irq_bit(q);
+		priv->rx_irq_mask |= priv->rx_irq[q];
 		u64_stats_init(&ring->syncp);
 	}
 
 	for (q = 0; q < priv->txqs; q++) {
 		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
 
-		tx_irq_mask |= ralink_fe_tx_irq_bit(q);
+		tx_irq_mask |= priv->tx_irq[q];
 		u64_stats_init(&ring->syncp);
 	}
 
@@ -1261,10 +1580,20 @@ static int ralink_fe_init_queues(struct net_device *ndev,
 			RALINK_FE_NAPI_TX);
 	}
 
-	netif_napi_add_weight(ndev,
-		&priv->rx_napi_all,
-		ralink_fe_rx_poll_all,
-		RALINK_FE_NAPI_RX);
+	switch (priv->rxqs) {
+	case 1:
+		netif_napi_add_weight(ndev, &priv->rx_napi_all,
+			     ralink_fe_rx_poll_1q,
+			     RALINK_FE_NAPI_RX);
+		break;
+	case 2:
+		netif_napi_add_weight(ndev, &priv->rx_napi_all,
+			     ralink_fe_rx_poll_2q,
+			     RALINK_FE_NAPI_RX);
+		break;
+	default:
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -1277,6 +1606,122 @@ static void ralink_fe_napi_cleanup(struct ralink_fe_priv *priv)
 		netif_napi_del(&priv->tx_ring[q].napi.napi);
 
 	netif_napi_del(&priv->rx_napi_all);
+}
+
+static void ralink_fe_pdma_sched_init(struct ralink_fe_priv *priv)
+{
+	u32 val;
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
+
+	return;
+
+	switch (priv->soc->pdma_sched) {
+	case RALINK_PDMA_SCHED_RT305X:
+		/* one register: mode + encoded WRR weights */
+		ralink_fe_w32(priv, pdma->sch_cfg,
+				RA_SCH_MODE(RA_SCH_MODE_WRR) |
+				RA_FE_SCH_EQUAL_WRR);
+		ralink_fe_w32(priv, RT305X_GDMA1_SCH_CFG, RA_FE_SCH_EQUAL_WRR);
+		ralink_fe_w32(priv, RT305X_GDMA2_SCH_CFG, RA_FE_SCH_EQUAL_WRR);
+		ralink_fe_w32(priv, RT305X_CDMA_SCH_CFG,  RA_FE_SCH_EQUAL_WRR);
+
+		val = ralink_fe_r32(priv, FE_GLO_CFG);
+		val &= ~FE_US_CYC_CNT_MASK;
+		val |= FE_US_CYC_CNT_SET(133);
+		ralink_fe_w32(priv, FE_GLO_CFG, val);
+
+		ralink_fe_w32(priv, RT305x_PDMA_FC_CFG, 0);
+		break;
+	case RALINK_PDMA_SCHED_RT5350:
+		/* v2 layout: separate scheduler/WRR registers */
+		ralink_fe_w32(priv, pdma->sch_cfg,
+				RA_SCH_MODE(RA_SCH_MODE_WRR));
+
+		ralink_fe_w32(priv, pdma->wrr_cfg,
+				RA_FE_SCH_EQUAL_WRR);
+			break;
+	case RALINK_PDMA_SCHED_MT7620:
+
+		break;
+	}
+}
+
+static int ralink_fe_phylink_init(struct ralink_fe_priv *priv)
+{
+	struct device_node *port;
+	phy_interface_t interface;
+	u32 id;
+	int ret;
+
+	/*
+	 * We support GMAC0 only for now. of_node_name_eq() ignores the
+	 * unit address, so this finds port@0 without a generic port loop.
+	 */
+	port = of_get_available_child_by_name(priv->dev->of_node, "port");
+	if (!port)
+		return 0;
+
+	ret = of_property_read_u32(port, "reg", &id);
+	if (ret || id != 0) {
+		of_node_put(port);
+		return dev_err_probe(priv->dev, -EINVAL,
+				     "only GMAC0 is supported\n");
+	}
+
+	ret = of_get_phy_mode(port, &interface);
+	if (ret) {
+		of_node_put(port);
+		return dev_err_probe(priv->dev, ret,
+				     "missing/invalid GMAC phy-mode\n");
+	}
+
+	priv->phylink_config.dev = &priv->ndev->dev;
+	priv->phylink_config.type = PHYLINK_NETDEV;
+	priv->phylink_config.mac_capabilities =
+		MAC_SYM_PAUSE | MAC_ASYM_PAUSE |
+		MAC_10 | MAC_100 | MAC_1000FD;
+
+	__set_bit(PHY_INTERFACE_MODE_MII,
+		  priv->phylink_config.supported_interfaces);
+	__set_bit(PHY_INTERFACE_MODE_RMII,
+		  priv->phylink_config.supported_interfaces);
+	phy_interface_set_rgmii(priv->phylink_config.supported_interfaces);
+
+	priv->phylink =
+		phylink_create(&priv->phylink_config,
+			       of_fwnode_handle(port),
+			       interface,
+			       &ralink_fe_phylink_mac_ops);
+	if (IS_ERR(priv->phylink)) {
+		ret = PTR_ERR(priv->phylink);
+		priv->phylink = NULL;
+		of_node_put(port);
+		return dev_err_probe(priv->dev, ret,
+				     "failed to create phylink\n");
+	}
+
+	ret = phylink_of_phy_connect(priv->phylink, port, 0);
+	of_node_put(port);
+
+	if (ret) {
+		phylink_destroy(priv->phylink);
+		priv->phylink = NULL;
+
+		return dev_err_probe(priv->dev, ret,
+				     "failed to connect phylink\n");
+	}
+
+	return 0;
+}
+
+static void ralink_fe_phylink_cleanup(struct ralink_fe_priv *priv)
+{
+	if (!priv->phylink)
+		return;
+
+	phylink_disconnect_phy(priv->phylink);
+	phylink_destroy(priv->phylink);
+	priv->phylink = NULL;
 }
 
 static int ralink_fe_hw_init(struct platform_device *pdev,
@@ -1320,6 +1765,11 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 		}
 	}
 
+	ralink_fe_pdma_sched_init(priv);
+	ralink_fe_setup_rx_csum_ctrl(priv);
+	if (priv->soc->has_tx_csum)
+		ralink_fe_setup_tx_csum_ctrl(priv);
+
 	if (priv->soc->has_sdm)
 		ralink_fe_setup_sdm(priv);
 
@@ -1343,16 +1793,17 @@ static int ralink_fe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	const struct ralink_fe_soc_data *soc;
+	const struct ralink_fe_reg_map *pdma;
 	struct net_device *ndev;
 	struct ralink_fe_priv *priv;
-	int err;
+	int err, q;
 
 	soc = of_device_get_match_data(dev);
 	if (!soc)
 		return dev_err_probe(dev, -EINVAL, "missing match data\n");
 
 	ndev = devm_alloc_etherdev_mqs(dev, sizeof(*priv),
-				       soc->txqs, soc->rxqs);
+				soc->txqs, soc->rxqs);
 	if (!ndev)
 		return -ENOMEM;
 
@@ -1364,10 +1815,24 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	priv->soc = soc;
 	priv->txqs = soc->txqs;
 	priv->rxqs = soc->rxqs;
+	pdma = priv->soc->reg_map;
 
 	err = ralink_fe_hw_init(pdev, priv);
 	if (err)
 		return err;
+
+	for (q = 0; q < priv->txqs; q++) {
+		priv->tx_cpu_idx[q] = priv->base + pdma->tx_cpu_idx[q];
+		priv->tx_dma_idx[q] = priv->base + pdma->tx_dma_idx[q];
+		priv->tx_irq[q] = pdma->tx_irq[q];
+	}
+
+	for (q = 0; q < priv->rxqs; q++) {
+		priv->rx_cpu_idx[q] = priv->base + pdma->rx_cpu_idx[q];
+		priv->rx_irq[q] = pdma->rx_irq[q];
+	}
+	priv->int_status = priv->base + pdma->int_status;
+	priv->int_enable = priv->base + pdma->int_enable;
 
 	err = ralink_fe_alloc_desc(priv);
 	if (err)
@@ -1383,29 +1848,53 @@ static int ralink_fe_probe(struct platform_device *pdev)
 
 	ralink_fe_setup_netdev(ndev, priv);
 
+	mutex_init(&priv->mdio_lock);
+
+	err = ralink_fe_mdio_register(priv);
+	if (err)
+		goto err_pp;
+
+	err = ralink_fe_phylink_init(priv);
+	if (err)
+		goto err_pp;
+
 	platform_set_drvdata(pdev, priv);
 
 	spin_lock_init(&priv->irq_lock);
 
 	ralink_fe_dma_disable(priv);
-	ralink_fe_w32(priv, PDMA_INT_STATUS, 0xffffffff);
-	ralink_fe_w32(priv, PDMA_INT_ENABLE, 0);
+	writel(0xffffffff, priv->int_status);
+	writel(0, priv->int_enable);
 
 	err = devm_request_irq(dev, priv->irq, ralink_fe_irq, 0,
 			       dev_name(dev), priv);
 	if (err) {
 		err = dev_err_probe(dev, err, "failed to request IRQ");
-		goto err_pp;
+		goto err_phylink;
+	}
+
+	if (priv->soc->ppe != RA_PPE_NONE) {
+		priv->ppe = devm_kzalloc(priv->dev, sizeof(*priv->ppe),
+					GFP_KERNEL);
+		if (!priv->ppe) {
+			err = -ENOMEM;
+			goto err_phylink;
+		}
+		err = ra_ppe_init(priv);
+		if (err)
+			goto err_phylink;
 	}
 
 	err = register_netdev(ndev);
 	if (err)
-		goto err_pp;
+		goto err_phylink;
 
 	dev_info(dev, "Ralink FE: %u TXQ / %u RXQ\n", priv->txqs, priv->rxqs);
 
 	return 0;
 
+err_phylink:
+	ralink_fe_phylink_cleanup(priv);
 err_pp:
 	ralink_fe_cleanup_page_pools(priv);
 err_napi:
@@ -1420,36 +1909,247 @@ static void ralink_fe_remove(struct platform_device *pdev)
 	struct ralink_fe_priv *priv = platform_get_drvdata(pdev);
 
 	unregister_netdev(priv->ndev);
+	ralink_fe_phylink_cleanup(priv);
+
+	if (priv->soc->ppe != RA_PPE_NONE)
+		ra_ppe_stop(priv->ppe);
+
 	ralink_fe_cleanup_page_pools(priv);
 	ralink_fe_hw_cleanup(priv);
 }
 
-static const struct ralink_fe_soc_data rt5350_data = {
-	.txqs = 4,
-	.rxqs = 2,
-	.has_sdm = true,
-	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+static const struct ralink_fe_reg_map pdma_v1_regs = {
+	.tx_base_ptr = { 0x0110, 0x0120, 0x0140, 0x0150 },
+	.tx_max_cnt  = { 0x0114, 0x0124, 0x0144, 0x0154 },
+	.tx_cpu_idx  = { 0x0118, 0x0128, 0x0148, 0x0158 },
+	.tx_dma_idx  = { 0x011c, 0x012c, 0x014c, 0x015c },
+
+	.rx_base_ptr = { 0x0130 },
+	.rx_max_cnt  = { 0x0134 },
+	.rx_cpu_idx = { 0x0138 },
+	.rx_dma_idx  = { 0x013c },
+
+	.tx_irq = { BIT(8), BIT(9), BIT(10), BIT(11) },
+	.rx_irq = { BIT(2) },
+
+	.glo_cfg = 0x0100,
+	.rst_idx = 0x0104,
+	.dly_int_cfg = 0x010c,
+	.int_status = 0x0010,
+	.int_enable = 0x0014,
+	.sch_cfg = 0x0108,
 };
 
-static const struct ralink_fe_soc_data mt7628_data = {
+static const struct ralink_fe_reg_map pdma_v2_regs = {
+	.tx_base_ptr = { 0x0800, 0x0810, 0x0820, 0x0830 },
+	.tx_max_cnt  = { 0x0804, 0x0814, 0x0824, 0x0834 },
+	.tx_cpu_idx  = { 0x0808, 0x0818, 0x0828, 0x0838 },
+	.tx_dma_idx  = { 0x080c, 0x081c, 0x082c, 0x083c },
+
+	.rx_base_ptr = { 0x0900, 0x0910 },
+	.rx_max_cnt  = { 0x0904, 0x0914 },
+	.rx_cpu_idx = { 0x0908, 0x0918 },
+	.rx_dma_idx  = { 0x090c, 0x091c },
+
+	.tx_irq = { BIT(0), BIT(1), BIT(2), BIT(3) },
+	.rx_irq = { BIT(16), BIT(17) },
+
+	.glo_cfg = 0x0a04,
+	.rst_idx = 0x0a08,
+	.dly_int_cfg = 0x0a0c,
+	.int_status = 0x0a20,
+	.int_enable = 0x0a28,
+	.sch_cfg = 0x0a80,
+	.wrr_cfg = 0x0a84,
+};
+
+static const struct ralink_fe_soc_data rt2880_data = {
+	.name = "rt2880",
+	.reg_map = &pdma_v1_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.txqs = 2,
+	.rxqs = 1,
+
+	.tx4_port = RA_TX4_PNQN,
+	.dsa_use_oob = false,
+	.has_tx_csum = true,
+	.cdm_csg_cfg = 0x0080,
+	/* RT305x GDM: enable checksum verification */
+	.rx_csum_ctrl = 0x0020,
+	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
+	/* BC / MC /UC to CPU */
+	.rx_csum_ctrl_clear = 0xffff,
+	.rx_csum_valid = RX4_DMA_L4FVLD,
+	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+
+	.mac_adr_l = 0x002c,
+	.mac_adr_h = 0x0030,
+
+	.has_sdm = false,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+	.ppe = RA_PPE_V1,
+	.foe_entries = 1024,
+};
+
+static const struct ralink_fe_soc_data rt305x_data = {
+	.name = "rt305x",
+	.reg_map = &pdma_v1_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.txqs = 4,
+	.rxqs = 1,
+
+	.tx4_port = RA_TX4_PNQN,
+	.dsa_use_oob = false,
+	.has_tx_csum = true,
+	.cdm_csg_cfg = 0x0080,
+	/* RT305x GDM: enable checksum verification */
+	.rx_csum_ctrl = 0x0020,
+	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
+	/* BC / MC /UC to CPU */
+	.rx_csum_ctrl_clear = 0xffff,
+	.rx_csum_valid = RX4_DMA_L4FVLD,
+	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+
+	.mac_adr_l = 0x002c,
+	.mac_adr_h = 0x0030,
+
+	.has_sdm = false,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+	.ppe = RA_PPE_V1,
+	.foe_entries = 4096,
+};
+
+static const struct ralink_fe_soc_data rt3883_data = {
+	.name = "rt3883",
+	.reg_map = &pdma_v1_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.txqs = 4,
+	.rxqs = 1,
+
+	.tx4_port = RA_TX4_PNQN,
+	.dsa_use_oob = false,
+	.has_tx_csum = true,
+	.cdm_csg_cfg = 0x0080,
+	/* RT305x GDM: enable checksum verification */
+	.rx_csum_ctrl = 0x0020,
+	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
+	/* BC / MC /UC to CPU */
+	.rx_csum_ctrl_clear = 0xffff,
+	.rx_csum_valid = RX4_DMA_L4FVLD,
+	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+
+	.mac_adr_l = 0x002c,
+	.mac_adr_h = 0x0030,
+
+	.has_sdm = false,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+	.ppe = RA_PPE_V1,
+	.foe_entries = 4096,
+};
+
+static const struct ralink_fe_soc_data rt5350_data = {
+	.name = "rt5350",
+	.reg_map = &pdma_v2_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_RT5350,
 	.txqs = 4,
 	.rxqs = 2,
+
+	.tx4_port = RA_TX4_NONE,
+	.dsa_use_oob = false,
+	.has_tx_csum = false,
+
+	/* RT5350 SDM:
+	 * clear drop-on-checksum-error bits so errors are reported in RXD.
+	 */
+	.rx_csum_ctrl = 0x0c00,
+	.rx_csum_ctrl_set = 0,
+	.rx_csum_ctrl_clear = SDM_IPCS | SDM_TCPCS | SDM_UDPCS,
+	.rx_csum_valid = RX4_DMA_L4FVLD,
+	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+
+	.mac_adr_l = 0x0c0c,
+	.mac_adr_h = 0x0c10,
+
 	.has_sdm = true,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+	.ppe = RA_PPE_NONE,
+};
+
+static const struct ralink_fe_soc_data mt7620_data = {
+	.name = "mt7620",
+	.reg_map = &pdma_v2_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_MT7620,
+	.txqs = 4,
+	.rxqs = 2,
+
+	.tx4_port = RA_TX4_FP,
+	.dsa_use_oob = true,
+	.has_tx_csum = true,
+	.cdm_csg_cfg = 0x0400,
+	/* MT7620 GDM: enable checksum verification */
+	.rx_csum_ctrl = 0x0600,
+	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
+	/* MT7620 GDM forward to CPU */
+	.rx_csum_ctrl_clear = 0x7,
+
+	.rx_csum_valid = MT7620_RX4_PKT_L4_VALID,
+	.rx_csum_clear = MT7620_RX4_PKT_L4_ERR | MT7620_RX4_PKT_IP_ERR,
+
+	.mac_adr_l = 0x13fe4,
+	.mac_adr_h = 0x13ff8,
+
+	.has_sdm = false,
+	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
+
+	.ppe = RA_PPE_NONE,
+	.ppe = RA_PPE_V2,
+	.foe_entries = 4096,
+};
+
+static const struct ralink_fe_soc_data mt76x8_data = {
+	.name = "mt76x8",
+	.reg_map = &pdma_v2_regs,
+	.pdma_sched = RALINK_PDMA_SCHED_RT5350,
+	.txqs = 4,
+	.rxqs = 2,
+
+	.tx4_port = RA_TX4_NONE,
+	.dsa_use_oob = false,
+	.has_tx_csum = false,
+	/* MT76x8 SDM:
+	 * clear drop-on-checksum-error bits so errors are reported in RXD.
+	 */
+	.rx_csum_ctrl = 0x0c00,
+	.rx_csum_ctrl_set = 0,
+	.rx_csum_ctrl_clear = SDM_IPCS | SDM_TCPCS | SDM_UDPCS,
+	.rx_csum_valid = RX4_DMA_L4FVLD,
+	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+
+	.mac_adr_l = 0x0c0c,
+	.mac_adr_h = 0x0c10,
+
+	.has_sdm = true,
+	.ppe = RA_PPE_NONE,
 	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
 };
 
 static const struct of_device_id ralink_fe_of_match[] = {
+	{ .compatible = "ralink,rt2880-fe", .data = &rt2880_data },
+	{ .compatible = "ralink,rt305x-fe", .data = &rt305x_data },
+	{ .compatible = "ralink,rt3883-fe", .data = &rt3883_data },
 	{ .compatible = "ralink,rt5350-fe", .data = &rt5350_data },
-	{ .compatible = "mediatek,mt7628-fe", .data = &mt7628_data },
+	{ .compatible = "mediatek,mt7620-fe", .data = &mt7620_data },
+	{ .compatible = "mediatek,mt76x8-fe", .data = &mt76x8_data },
 	{ /* sentinel */ }
 };
+
 MODULE_DEVICE_TABLE(of, ralink_fe_of_match);
 
 static struct platform_driver ralink_fe_driver = {
 	.probe = ralink_fe_probe,
 	.remove = ralink_fe_remove,
 	.driver = {
-		.name = "ralink-fe",
+		.name = "ralink_fe",
 		.of_match_table = ralink_fe_of_match,
 	},
 };

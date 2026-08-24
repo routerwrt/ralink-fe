@@ -2,6 +2,11 @@
 #ifndef __RALINK_FE_H
 #define __RALINK_FE_H
 
+#include <linux/mutex.h>
+#include <linux/netdevice.h>
+#include <linux/phylink.h>
+#include <linux/u64_stats_sync.h>
+
 /* --- configurable --- */
 #define RALINK_FE_TX_RING_SIZE		128
 #define RALINK_FE_RX_RING_SIZE		256
@@ -11,6 +16,8 @@
 
 #define RALINK_FE_TX_STOP_RESERVE	16
 #define RALINK_FE_TX_WAKE_THRESH	16
+
+#define RALINK_MAX_DSA_PORTS		8
 
 /* Power-of-2 masks */
 #define RALINK_FE_TX_RING_MASK		(RALINK_FE_TX_RING_SIZE - 1)
@@ -24,25 +31,28 @@
 #define RALINK_FE_MAX_TXQ		4
 #define RALINK_FE_MAX_RXQ		2
 
-/* ---- Base offsets ---- */
-#define PDMA_OFFSET			0x0800
+#define PDMA_RST_DTX_IDX0		BIT(0)
+#define PDMA_RST_DTX_IDX1		BIT(1)
+#define PDMA_RST_DTX_IDX2		BIT(2)
+#define PDMA_RST_DTX_IDX3		BIT(3)
+#define PDMA_RST_DRX_IDX0		BIT(16)
+#define PDMA_RST_DRX_IDX1		BIT(17)
 
-#define PDMA_GLO_CFG			(PDMA_OFFSET + 0x204)
-#define PDMA_RST_CFG			(PDMA_OFFSET + 0x208)
-#define PDMA_DLY_INT_CFG		(PDMA_OFFSET + 0x20C)
-#define PDMA_INT_STATUS			(PDMA_OFFSET + 0x220)
-#define PDMA_INT_ENABLE			(PDMA_OFFSET + 0x228)
+static const u32 tx_rst[] = {
+	PDMA_RST_DTX_IDX0,
+	PDMA_RST_DTX_IDX1,
+	PDMA_RST_DTX_IDX2,
+	PDMA_RST_DTX_IDX3,
+};
 
-#define TX_BASE_PTR0			(PDMA_OFFSET + 0x000)
-#define TX_MAX_CNT0			(PDMA_OFFSET + 0x004)
-#define TX_CTX_IDX0			(PDMA_OFFSET + 0x008)
-#define TX_DTX_IDX0			(PDMA_OFFSET + 0x00C)
-
-#define RX_BASE_PTR0			(PDMA_OFFSET + 0x100)
-#define RX_MAX_CNT0			(PDMA_OFFSET + 0x104)
-#define RX_CTX_IDX0			(PDMA_OFFSET + 0x108)
+static const u32 rx_rst[] = {
+	PDMA_RST_DRX_IDX0,
+	PDMA_RST_DRX_IDX1,
+};
 
 /* ---- PDMA GLO bits ---- */
+#define RX_2B_OFFSET			BIT(31)
+#define CSR_CLKGATE			BIT(30)
 #define TX_WB_DDONE			BIT(6)
 #define RX_DMA_BUSY			BIT(3)
 #define RX_DMA_EN			BIT(2)
@@ -52,23 +62,37 @@
 #define PDMA_BT_SIZE_8WORDS		(1 << 4)
 #define PDMA_BT_SIZE_16WORDS		(2 << 4)
 
-/* PDMA TX scheduling */
-#define PDMA_SCH		(PDMA_OFFSET + 0x280)
-#define PDMA_WRR		(PDMA_OFFSET + 0x284)
-#define PDMA_SCH_MODE_MASK	GENMASK(25, 24)
-#define  PDMA_SCH_MODE_WRR	0x0
-#define PDMA_SCH_MODE(v)	FIELD_PREP(PDMA_SCH_MODE_MASK, (v))
-#define PDMA_WRR_WT_Q0_MASK	GENMASK(2, 0)
-#define PDMA_WRR_WT_Q1_MASK	GENMASK(6, 4)
-#define PDMA_WRR_WT_Q2_MASK	GENMASK(10, 8)
-#define PDMA_WRR_WT_Q3_MASK	GENMASK(14, 12)
-#define PDMA_WRR_WT_Q0(v)	FIELD_PREP(PDMA_WRR_WT_Q0_MASK, (v))
-#define PDMA_WRR_WT_Q1(v)	FIELD_PREP(PDMA_WRR_WT_Q1_MASK, (v))
-#define PDMA_WRR_WT_Q2(v)	FIELD_PREP(PDMA_WRR_WT_Q2_MASK, (v))
-#define PDMA_WRR_WT_Q3(v)	FIELD_PREP(PDMA_WRR_WT_Q3_MASK, (v))
+#define RT305x_PDMA_FC_CFG	0x01f0
+
+/* RALINK TX scheduling */
+#define RA_SCH_MODE_MASK	GENMASK(25, 24)
+#define  RA_SCH_MODE_WRR	0x0
+#define RA_SCH_MODE(v)		FIELD_PREP(RA_SCH_MODE_MASK, (v))
+#define RA_WRR_WT_Q0_MASK	GENMASK(2, 0)
+#define RA_WRR_WT_Q1_MASK	GENMASK(6, 4)
+#define RA_WRR_WT_Q2_MASK	GENMASK(10, 8)
+#define RA_WRR_WT_Q3_MASK	GENMASK(14, 12)
+#define RA_WRR_WT_Q0(v)		FIELD_PREP(RA_WRR_WT_Q0_MASK, (v))
+#define RA_WRR_WT_Q1(v)		FIELD_PREP(RA_WRR_WT_Q1_MASK, (v))
+#define RA_WRR_WT_Q2(v)		FIELD_PREP(RA_WRR_WT_Q2_MASK, (v))
+#define RA_WRR_WT_Q3(v)		FIELD_PREP(RA_WRR_WT_Q3_MASK, (v))
+
+#define RA_FE_WT_1		0
+
+#define RA_FE_SCH_EQUAL_WRR	(RA_WRR_WT_Q0(RA_FE_WT_1) | \
+				RA_WRR_WT_Q1(RA_FE_WT_1) | \
+				RA_WRR_WT_Q2(RA_FE_WT_1) | \
+				RA_WRR_WT_Q3(RA_FE_WT_1))
+
+#define RT305X_GDMA1_SCH_CFG	0x0024
+#define RT305X_GDMA2_SCH_CFG	0x0064
+#define RT305X_CDMA_SCH_CFG	0x0084
+
+#define FE_GLO_CFG		0x0008
+#define FE_US_CYC_CNT_MASK	GENMASK(15, 8)
+#define FE_US_CYC_CNT_SET(v)	FIELD_PREP(FE_US_CYC_CNT_MASK, (v))
 
 /* SDM – Switch DMA glue block */
-
 #define SDM_OFFSET		0x0c00
 /* SDM registers */
 #define SDM_CON			(SDM_OFFSET + 0x0000)
@@ -85,6 +109,39 @@
 #define SDM_TCPCS		BIT(17)
 #define SDM_IPCS		BIT(16)
 #define SDM_EXT_VLAN		GENMASK(15, 0)
+
+/* GDM */
+#define GDM_ICS_EN		BIT(22)
+#define GDM_TCS_EN		BIT(21)
+#define GDM_UCS_EN		BIT(20)
+
+/* CDM */
+#define CDM_ICS_GEN_EN		BIT(2)
+#define CDM_UCS_GEN_EN		BIT(1)
+#define CDM_TCS_GEN_EN		BIT(0)
+
+/* RT2880/RT3883 FE MDIO / GE1 */
+#define FE_MDIO_ACCESS			0x0000
+#define FE_MDIO_CFG			0x0004
+
+#define FE_MDIO_CMD_TRG			BIT(31)
+#define FE_MDIO_WRITE			BIT(30)
+#define FE_MDIO_PHY_ADDR		GENMASK(28, 24)
+#define FE_MDIO_REG_ADDR		GENMASK(20, 16)
+#define FE_MDIO_DATA			GENMASK(15, 0)
+
+#define FE_MDIO_CFG_GP1_AUTO_POLL	BIT(29)
+#define FE_MDIO_CFG_GP1_FRC_EN		BIT(15)
+#define FE_MDIO_CFG_GP1_SPEED		GENMASK(14, 13)
+#define FE_MDIO_CFG_GP1_DUPLEX		BIT(12)
+#define FE_MDIO_CFG_GP1_FC_TX		BIT(11)
+#define FE_MDIO_CFG_GP1_FC_RX		BIT(10)
+
+#define FE_MDIO_CFG_GP1_SPEED_10	0
+#define FE_MDIO_CFG_GP1_SPEED_100	1
+#define FE_MDIO_CFG_GP1_SPEED_1000	2
+
+#define RALINK_FE_MDIO_TIMEOUT_US	1000
 
 /* ---- descriptors ---- */
 struct ralink_fe_tx_desc {
@@ -104,6 +161,19 @@ struct ralink_fe_tx_desc {
 #define TX2_DMA_SDL0(_x)	FIELD_PREP(TX2_DMA_SDL0_MASK, (_x))
 #define TX2_DMA_SDL1_GET(_x)	FIELD_GET(TX2_DMA_SDL1_MASK, (_x))
 #define TX2_DMA_SDL0_GET(_x)	FIELD_GET(TX2_DMA_SDL0_MASK, (_x))
+
+#define TX4_DMA_ICO		BIT(31)
+#define TX4_DMA_UCO		BIT(30)
+#define TX4_DMA_TCO		BIT(29)
+
+#define TX4_DMA_PN_MASK		GENMASK(26, 24)
+#define TX4_DMA_QN_MASK		GENMASK(18, 16)
+
+#define TX4_DMA_PN(_x)		FIELD_PREP(TX4_DMA_PN_MASK, (_x))
+#define TX4_DMA_QN(_x)		FIELD_PREP(TX4_DMA_QN_MASK, (_x))
+
+#define MT7620_FP_BMAP		GENMASK(27, 20)
+#define TX4_DMA_FP(_x)		FIELD_PREP(MT7620_FP_BMAP, (_x))
 
 struct ralink_fe_rx_desc {
 	u32 info1; /* addr */
@@ -130,19 +200,96 @@ struct ralink_fe_rx_desc {
 #define RX4_DMA_L4FVLD		BIT(30)
 #define RX4_DMA_IPF		BIT(29)
 #define RX4_DMA_L4F		BIT(28)
-#define RX4_DMA_SP		GENMASK(26, 24)
-#define RX4_DMA_PAR_RLT		GENMASK(23, 16)
-#define RX4_DMA_ADR		GENMASK(1, 0)
+#define RX4_DMA_AIS		BIT(27)
+#define RX4_DMA_SP_MASK		GENMASK(26, 24)
+#define RX4_DMA_AI_MASK		GENMASK(23, 16)
+#define RX4_DMA_FVLD		BIT(14)
+#define RX4_DMA_FOE_ENTRY	GENMASK(13, 0)
+
+#define RX4_DMA_SP_GET(_x)	FIELD_GET(RX4_DMA_SP_MASK, (_x))
+#define RX4_DMA_AI_GET(_x)	FIELD_GET(RX4_DMA_AI_MASK, (_x))
+#define RX4_DMA_FOE_GET(_x)	FIELD_GET(RX4_DMA_FOE_ENTRY, (_x))
+
+#define MT7620_RX4_PKT_INFO	GENMASK(27, 22)
+#define MT7620_RX4_PKT_L4_ERR	BIT(22)
+#define MT7620_RX4_PKT_L4_VALID	BIT(23)
+#define MT7620_RX4_PKT_IP_ERR	BIT(25)
+#define MT7620_RX4_SP_MASK	GENMASK(21, 19)
+#define MT7620_DMA_SP_GET(_x)	FIELD_GET(MT7620_RX4_SP_MASK, (_x))
+
 
 /* ---- private ---- */
 #define RALINK_FE_TX_MAP0_PAGE  BIT(0)
 #define RALINK_FE_TX_MAP1_PAGE  BIT(1)
 
+enum ralink_pdma_sched {
+	RALINK_PDMA_SCHED_RT305X = 0,
+	RALINK_PDMA_SCHED_RT5350,
+	RALINK_PDMA_SCHED_MT7620,
+};
+
+enum ra_ppe_version {
+	RA_PPE_NONE = 0,
+	RA_PPE_V1,
+	RA_PPE_V2,
+};
+
+enum ra_tx4_port {
+	RA_TX4_NONE = 0,
+	RA_TX4_PNQN,
+	RA_TX4_FP,
+};
+
+struct ralink_fe_reg_map {
+	u32 tx_base_ptr[RALINK_FE_MAX_TXQ];
+	u32 tx_max_cnt[RALINK_FE_MAX_TXQ];
+	u32 tx_cpu_idx[RALINK_FE_MAX_TXQ];
+	u32 tx_dma_idx[RALINK_FE_MAX_TXQ];
+
+	u32 rx_base_ptr[RALINK_FE_MAX_RXQ];
+	u32 rx_max_cnt[RALINK_FE_MAX_RXQ];
+	u32 rx_cpu_idx[RALINK_FE_MAX_RXQ];
+	u32 rx_dma_idx[RALINK_FE_MAX_RXQ];
+
+	u32 tx_irq[RALINK_FE_MAX_TXQ];
+	u32 rx_irq[RALINK_FE_MAX_RXQ];
+
+	u32 glo_cfg;
+	u32 rst_idx;
+	u32 dly_int_cfg;
+	u32 int_status;
+	u32 int_enable;
+	u32 sch_cfg;
+	u32 wrr_cfg;
+};
+
 struct ralink_fe_soc_data {
-	u8				txqs;
-	u8				rxqs;
-	bool				has_sdm;
-	u32				pdma_bt_size;
+	const char			*name;
+	const struct ralink_fe_reg_map	*reg_map;
+	enum ralink_pdma_sched		pdma_sched;
+
+	u8			txqs;
+	u8			rxqs;
+
+	bool			dsa_use_oob;
+	u32			tx4_port;
+	bool			has_tx_csum;
+	u32			cdm_csg_cfg;
+
+	u32			rx_csum_ctrl;
+	u32			rx_csum_ctrl_set;
+	u32			rx_csum_ctrl_clear;
+	u32			rx_csum_valid;
+	u32			rx_csum_clear;
+
+	u32			mac_adr_l;
+	u32			mac_adr_h;
+
+	bool			has_sdm;
+	u32			pdma_bt_size;
+
+	enum ra_ppe_version	ppe;
+	u32			foe_entries;
 };
 
 /* Per-queue NAPI wrapper so poll callbacks can recover the queue index. */
@@ -196,10 +343,18 @@ struct ralink_fe_rx_ring {
 	u32				refill_fail;
 };
 
+
 struct ralink_fe_priv {
 	void __iomem			*base;
+	void __iomem			*tx_cpu_idx[RALINK_FE_MAX_TXQ];
+	void __iomem			*tx_dma_idx[RALINK_FE_MAX_TXQ];
+	void __iomem			*rx_cpu_idx[RALINK_FE_MAX_RXQ];
+	void __iomem			*int_status;
+	void __iomem			*int_enable;
+
 	struct device			*dev;
 	struct net_device		*ndev;
+	struct ra_ppe			*ppe;
 
 	const struct ralink_fe_soc_data	*soc;
 
@@ -209,15 +364,25 @@ struct ralink_fe_priv {
 	int				irq;
 	spinlock_t			irq_lock;
 	u32				irq_mask;
+
+	u32				tx_irq[RALINK_FE_MAX_TXQ];
+	u32				rx_irq[RALINK_FE_MAX_RXQ];
 	u32				rx_irq_mask;
 	u32				irq_mask_all;
-
 	u8				txqs;
 	u8				rxqs;
+	bool				dsa_use_oob;
+
+	struct mii_bus			*mii_bus;
+	struct mutex			mdio_lock;
+
+	struct phylink			*phylink;
+	struct phylink_config		phylink_config;
 
 	struct ralink_fe_tx_ring	tx_ring[RALINK_FE_MAX_TXQ];
 	struct ralink_fe_rx_ring	rx_ring[RALINK_FE_MAX_RXQ];
 	struct napi_struct		rx_napi_all;
+	struct metadata_dst		*dsa_meta[RALINK_MAX_DSA_PORTS];
 
 	u32				msg_enable;
 };
