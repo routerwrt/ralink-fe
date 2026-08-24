@@ -500,6 +500,12 @@ static int ralink_fe_open(struct net_device *ndev)
 
 	ralink_fe_dma_enable(priv);
 
+	if (priv->ppe) {
+		err = ra_ppe_start(priv->ppe);
+		if (err)
+			goto err_dma;
+	}
+
 	ralink_fe_irq_enable(priv, priv->irq_mask_all);
 
 	if (priv->phylink)
@@ -511,11 +517,19 @@ static int ralink_fe_open(struct net_device *ndev)
 
 	return 0;
 
+err_dma:
+	ralink_fe_dma_disable(priv);
+
+	for (q = 0; q < priv->txqs; q++)
+		napi_disable(&priv->tx_ring[q].napi.napi);
+
+	napi_disable(&priv->rx_napi_all);
+
 err_release_rx:
 	for (q = 0; q < priv->rxqs; q++)
 		ralink_fe_rx_release_ring(priv, q);
 
-	return -ENOMEM;
+	return err;
 }
 
 static int ralink_fe_stop(struct net_device *ndev)
@@ -560,6 +574,9 @@ static int ralink_fe_stop(struct net_device *ndev)
 
 	for (q = 0; q < priv->rxqs; q++)
 		ralink_fe_rx_release_ring(priv, q);
+
+	if (priv->ppe)
+		ra_ppe_stop(priv->ppe);
 
 	if (priv->phylink)
 		phylink_stop(priv->phylink);
@@ -1912,7 +1929,7 @@ static void ralink_fe_remove(struct platform_device *pdev)
 	ralink_fe_phylink_cleanup(priv);
 
 	if (priv->soc->ppe != RA_PPE_NONE)
-		ra_ppe_stop(priv->ppe);
+		ra_ppe_deinit(priv->ppe);
 
 	ralink_fe_cleanup_page_pools(priv);
 	ralink_fe_hw_cleanup(priv);
