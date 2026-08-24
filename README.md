@@ -1,6 +1,6 @@
 # Ralink-fe
 
-net: ethernet: ralink: add FE driver
+net: ethernet: ralink: add FE and PPE driver
 
 Add a driver for the Ralink/MediaTek Frame Engine (FE) Ethernet
 controller.
@@ -17,7 +17,11 @@ Features:
 - Per-queue statistics and ethtool support
 - DSA-aware queue selection
 
-The FE does not provide a standalone MAC or PHY interface; link
-handling is delegated to the associated switch (e.g. ralink esw).
+For SoCs with internal switches, the FE does not provide a standalone
+MAC or PHY interface; link handling is delegated to the associated switch
+(e.g. ralink esw).
+
+Initial support is added for the Ralink PPEv1 as found in the RT2880,
+RT305x and RT3883 SoC's. The PPE is DSA aware to handle the Ralink Tag.
 
 Signed-off-by: Richard van Schagen <richard@routerwrt.org>
