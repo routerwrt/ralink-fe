@@ -84,9 +84,43 @@ static const u32 rx_rst[] = {
 				RA_WRR_WT_Q2(RA_FE_WT_1) | \
 				RA_WRR_WT_Q3(RA_FE_WT_1))
 
-#define RT305X_GDMA1_SCH_CFG	0x0024
-#define RT305X_GDMA2_SCH_CFG	0x0064
-#define RT305X_CDMA_SCH_CFG	0x0084
+/* PDMA shaper: two queues per scheduler register */
+#define PDMA_SHPR_MAX_BKT_HI		BIT(31)
+#define PDMA_SHPR_MAX_RATE_ULMT_HI	BIT(30)
+#define PDMA_SHPR_MAX_WEIGHT_HI_MASK	GENMASK(29, 28)
+#define PDMA_SHPR_MIN_RATE_HI_MASK	GENMASK(27, 26)
+#define PDMA_SHPR_MAX_RATE_HI_MASK	GENMASK(25, 16)
+
+#define PDMA_SHPR_MAX_BKT_LO		BIT(15)
+#define PDMA_SHPR_MAX_RATE_ULMT_LO	BIT(14)
+#define PDMA_SHPR_MAX_WEIGHT_LO_MASK	GENMASK(13, 12)
+#define PDMA_SHPR_MIN_RATE_LO_MASK	GENMASK(11, 10)
+#define PDMA_SHPR_MAX_RATE_LO_MASK	GENMASK(9, 0)
+
+#define PDMA_SHPR_MAX_WEIGHT_HI(v)	\
+	FIELD_PREP(PDMA_SHPR_MAX_WEIGHT_HI_MASK, (v))
+#define PDMA_SHPR_MIN_RATE_HI(v)	\
+	FIELD_PREP(PDMA_SHPR_MIN_RATE_HI_MASK, (v))
+#define PDMA_SHPR_MAX_RATE_HI(v)	\
+	FIELD_PREP(PDMA_SHPR_MAX_RATE_HI_MASK, (v))
+
+#define PDMA_SHPR_MAX_WEIGHT_LO(v)	\
+	FIELD_PREP(PDMA_SHPR_MAX_WEIGHT_LO_MASK, (v))
+#define PDMA_SHPR_MIN_RATE_LO(v)	\
+	FIELD_PREP(PDMA_SHPR_MIN_RATE_LO_MASK, (v))
+#define PDMA_SHPR_MAX_RATE_LO(v)	\
+	FIELD_PREP(PDMA_SHPR_MAX_RATE_LO_MASK, (v))
+
+#define PDMA_SHPR_WEIGHT_EQUAL		0
+#define PDMA_SHPR_MIN_RATE_NONE		3
+
+#define PDMA_SHPR_UNLIMITED_EQUAL				\
+	(PDMA_SHPR_MAX_RATE_ULMT_HI |				\
+	 PDMA_SHPR_MAX_WEIGHT_HI(PDMA_SHPR_WEIGHT_EQUAL) |	\
+	 PDMA_SHPR_MIN_RATE_HI(PDMA_SHPR_MIN_RATE_NONE) |	\
+	 PDMA_SHPR_MAX_RATE_ULMT_LO |				\
+	 PDMA_SHPR_MAX_WEIGHT_LO(PDMA_SHPR_WEIGHT_EQUAL) |	\
+	 PDMA_SHPR_MIN_RATE_LO(PDMA_SHPR_MIN_RATE_NONE))
 
 #define FE_GLO_CFG		0x0008
 #define FE_US_CYC_CNT_MASK	GENMASK(15, 8)
@@ -115,10 +149,22 @@ static const u32 rx_rst[] = {
 #define GDM_TCS_EN		BIT(21)
 #define GDM_UCS_EN		BIT(20)
 
-/* CDM */
-#define CDM_ICS_GEN_EN		BIT(2)
-#define CDM_UCS_GEN_EN		BIT(1)
-#define CDM_TCS_GEN_EN		BIT(0)
+#define GDM_SHPR_EN		BIT(24)
+#define GDM_SHPR_BK_SIZE_SHIFT 16
+#define GDM_SHPR_BK_SIZE_MASK  GENMASK(23, 16)
+#define GDM_SHPR_TK_RATE_MASK  GENMASK(13, 0)
+
+#define GDM_SHPR_BK_SIZE(x)    FIELD_PREP(GDM_SHPR_BK_SIZE_MASK, (x))
+#define GDM_SHPR_TK_RATE(x)    FIELD_PREP(GDM_SHPR_TK_RATE_MASK, (x))
+
+/* CDM_CSG_CFG */
+#define CDM_CSG_CFG_INS_VLAN_MASK	GENMASK(31, 16)
+#define CDM_CSG_CFG_SP_RING_MASK	GENMASK(15, 8)
+#define CDM_CSG_CFG_SP_RING(port)	BIT(8 + (port))
+
+#define CDM_ICS_GEN_EN			BIT(2)
+#define CDM_UCS_GEN_EN			BIT(1)
+#define CDM_TCS_GEN_EN			BIT(0)
 
 /* RT2880/RT3883 FE MDIO / GE1 */
 #define FE_MDIO_ACCESS			0x0000
@@ -222,10 +268,9 @@ struct ralink_fe_rx_desc {
 #define RALINK_FE_TX_MAP0_PAGE  BIT(0)
 #define RALINK_FE_TX_MAP1_PAGE  BIT(1)
 
-enum ralink_pdma_sched {
-	RALINK_PDMA_SCHED_RT305X = 0,
-	RALINK_PDMA_SCHED_RT5350,
-	RALINK_PDMA_SCHED_MT7620,
+enum ralink_dma_sched_type {
+	RALINK_DMA_SCHED_NONE,
+	RALINK_DMA_SCHED_V1,
 };
 
 enum ra_ppe_version {
@@ -259,22 +304,54 @@ struct ralink_fe_reg_map {
 	u32 dly_int_cfg;
 	u32 int_status;
 	u32 int_enable;
+};
+
+struct ralink_pdma_sched_regs {
+	u32 cfg0;
+	u32 cfg1;
+};
+
+enum ralink_pdma_sched_type {
+	RALINK_PDMA_SCHED_NONE,
+	RALINK_PDMA_SCHED_WRR,
+	RALINK_PDMA_SCHED_SHAPER,
+};
+
+struct ralink_cdm_regs {
+	u32 csg_cfg;
 	u32 sch_cfg;
-	u32 wrr_cfg;
+};
+
+struct ralink_gdma_regs {
+	u32 fwd_cfg;
+	u32 sch_cfg;
+	u32 shpr_cfg;
+};
+
+struct ralink_sdm_regs {
+	u32 con;
+	u32 rring;
+	u32 tring;
 };
 
 struct ralink_fe_soc_data {
 	const char			*name;
 	const struct ralink_fe_reg_map	*reg_map;
-	enum ralink_pdma_sched		pdma_sched;
+	u32			pdma_bt_size;
+
+	const struct ralink_pdma_sched_regs	*pdma_sched_regs;
+	enum ralink_pdma_sched_type	pdma_sched;
+
+	const struct ralink_cdm_regs *cdm_regs;
+	const struct ralink_gdma_regs *gdma1_regs;
+	const struct ralink_gdma_regs *gdma2_regs;
+	const struct ralink_sdm_regs *sdm_regs;
 
 	u8			txqs;
 	u8			rxqs;
 
 	bool			dsa_use_oob;
 	u32			tx4_port;
-	bool			has_tx_csum;
-	u32			cdm_csg_cfg;
 
 	u32			rx_csum_ctrl;
 	u32			rx_csum_ctrl_set;
@@ -284,9 +361,6 @@ struct ralink_fe_soc_data {
 
 	u32			mac_adr_l;
 	u32			mac_adr_h;
-
-	bool			has_sdm;
-	u32			pdma_bt_size;
 
 	enum ra_ppe_version	ppe;
 	u32			foe_entries;

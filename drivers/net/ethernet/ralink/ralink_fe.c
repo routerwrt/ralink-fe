@@ -1508,10 +1508,12 @@ static void ralink_fe_setup_netdev(struct net_device *ndev,
 
 	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_SG;
 
-	if (priv->soc->has_tx_csum)
+	if (priv->soc->cdm_regs)
 		ndev->hw_features |= NETIF_F_IP_CSUM;
+
 	if (priv->soc->ppe != RA_PPE_NONE)
 		ndev->hw_features |= NETIF_F_HW_TC;
+
 	ndev->features = ndev->hw_features;
 	ndev->vlan_features = ndev->hw_features;
 
@@ -1584,52 +1586,6 @@ static void ralink_fe_cleanup_page_pools(struct ralink_fe_priv *priv)
 
 	for (q = 0; q < priv->rxqs; q++)
 		ralink_fe_pp_destroy(priv, q);
-}
-
-static void ralink_fe_setup_sdm(struct ralink_fe_priv *priv)
-{
-//	u32 val;
-
-//	val = SDM_TCI_81XX | FIELD_PREP(SDM_EXT_VLAN, ETH_P_8021Q);
-//	val &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
-//	ralink_fe_w32(priv, SDM_CON, val);
-
-	/* priority tag 2 -> RX ring 1 */
-	ralink_fe_w32(priv, SDM_RRING, BIT(2));
-	/* no TX ring pause/FC */
-	ralink_fe_w32(priv, SDM_TRING, 0);
-}
-
-static void ralink_fe_setup_tx_csum_ctrl(struct ralink_fe_priv *priv)
-{
-	u32 val;
-
-	if (!priv->soc->cdm_csg_cfg)
-		return;
-
-	val = ralink_fe_r32(priv, priv->soc->cdm_csg_cfg);
-	if (priv->soc->has_tx_csum)
-		val |= CDM_ICS_GEN_EN | CDM_UCS_GEN_EN | CDM_TCS_GEN_EN;
-	else
-		val &= ~(CDM_ICS_GEN_EN | CDM_UCS_GEN_EN | CDM_TCS_GEN_EN);
-	/* move "wan" to RX1 on MT7620 */
-	if (priv->soc->rxqs > 1)
-		val |= BIT(8);
-
-	ralink_fe_w32(priv, priv->soc->cdm_csg_cfg, val);
-}
-
-static void ralink_fe_setup_rx_csum_ctrl(struct ralink_fe_priv *priv)
-{
-	u32 val;
-
-	if (!priv->soc->rx_csum_ctrl)
-		return;
-
-	val = ralink_fe_r32(priv, priv->soc->rx_csum_ctrl);
-	val |= priv->soc->rx_csum_ctrl_set;
-	val &= ~priv->soc->rx_csum_ctrl_clear;
-	ralink_fe_w32(priv, priv->soc->rx_csum_ctrl, val);
 }
 
 static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
@@ -1725,40 +1681,119 @@ static void ralink_fe_napi_cleanup(struct ralink_fe_priv *priv)
 
 static void ralink_fe_pdma_sched_init(struct ralink_fe_priv *priv)
 {
+	const struct ralink_pdma_sched_regs *regs =
+		priv->soc->pdma_sched_regs;
 	u32 val;
-	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
 
-	return;
+	if (!regs)
+		return;
 
 	switch (priv->soc->pdma_sched) {
-	case RALINK_PDMA_SCHED_RT305X:
-		/* one register: mode + encoded WRR weights */
-		ralink_fe_w32(priv, pdma->sch_cfg,
-				RA_SCH_MODE(RA_SCH_MODE_WRR) |
-				RA_FE_SCH_EQUAL_WRR);
-		ralink_fe_w32(priv, RT305X_GDMA1_SCH_CFG, RA_FE_SCH_EQUAL_WRR);
-		ralink_fe_w32(priv, RT305X_GDMA2_SCH_CFG, RA_FE_SCH_EQUAL_WRR);
-		ralink_fe_w32(priv, RT305X_CDMA_SCH_CFG,  RA_FE_SCH_EQUAL_WRR);
-
-		val = ralink_fe_r32(priv, FE_GLO_CFG);
-		val &= ~FE_US_CYC_CNT_MASK;
-		val |= FE_US_CYC_CNT_SET(133);
-		ralink_fe_w32(priv, FE_GLO_CFG, val);
-
-		ralink_fe_w32(priv, RT305x_PDMA_FC_CFG, 0);
+	case RALINK_PDMA_SCHED_NONE:
 		break;
-	case RALINK_PDMA_SCHED_RT5350:
-		/* v2 layout: separate scheduler/WRR registers */
-		ralink_fe_w32(priv, pdma->sch_cfg,
-				RA_SCH_MODE(RA_SCH_MODE_WRR));
+	case RALINK_PDMA_SCHED_WRR:
+		val = RA_SCH_MODE(RA_SCH_MODE_WRR);
 
-		ralink_fe_w32(priv, pdma->wrr_cfg,
-				RA_FE_SCH_EQUAL_WRR);
-			break;
-	case RALINK_PDMA_SCHED_MT7620:
+		if (!regs->cfg1)
+			val |= RA_FE_SCH_EQUAL_WRR;
 
+		ralink_fe_w32(priv, regs->cfg0, val);
+
+		if (regs->cfg1)
+			ralink_fe_w32(priv, regs->cfg1,
+				     RA_FE_SCH_EQUAL_WRR);
+		break;
+	case RALINK_PDMA_SCHED_SHAPER:
+		ralink_fe_w32(priv, regs->cfg0, PDMA_SHPR_UNLIMITED_EQUAL);
+		ralink_fe_w32(priv, regs->cfg1, PDMA_SHPR_UNLIMITED_EQUAL);
 		break;
 	}
+}
+
+static const struct ralink_fe_soc_data mt7620_data;
+
+static void ralink_fe_cdm_init(struct ralink_fe_priv *priv)
+{
+	const struct ralink_cdm_regs *cdm = priv->soc->cdm_regs;
+	u32 val;
+
+	if (!cdm)
+		return;
+
+	val = ralink_fe_r32(priv, cdm->csg_cfg);
+	val |= CDM_ICS_GEN_EN | CDM_UCS_GEN_EN | CDM_TCS_GEN_EN;
+
+	/*
+	 * FIXME: RX ring 1 steering is currently fixed to source port 0.
+	 * This should eventually follow the board/switch topology.
+	 */
+
+	if (priv->soc == &mt7620_data && priv->rxqs > 1)
+		val |= CDM_CSG_CFG_SP_RING(0);
+
+	ralink_fe_w32(priv, cdm->csg_cfg, val);
+
+	if (cdm->sch_cfg)
+		ralink_fe_w32(priv, cdm->sch_cfg, RA_FE_SCH_EQUAL_WRR);
+}
+
+static void ralink_fe_gdma_init(struct ralink_fe_priv *priv,
+				const struct ralink_gdma_regs *gdm)
+{
+	u32 val;
+
+	if (!gdm)
+		return;
+
+	if (gdm->sch_cfg)
+		ralink_fe_w32(priv, gdm->sch_cfg, RA_FE_SCH_EQUAL_WRR);
+
+	if (gdm->shpr_cfg) {
+		val = ralink_fe_r32(priv, gdm->shpr_cfg);
+		val &= ~GDM_SHPR_EN;
+		ralink_fe_w32(priv, gdm->shpr_cfg, val);
+	}
+}
+
+static void ralink_fe_sdm_init(struct ralink_fe_priv *priv)
+{
+	const struct ralink_sdm_regs *sdm = priv->soc->sdm_regs;
+	u32 val;
+
+	if (!sdm)
+		return;
+
+	val = ralink_fe_r32(priv, sdm->con);
+
+	/* Priority-based RX ring selection. */
+	val &= ~SDM_PORT_MAP;
+
+	/*
+	 * Report checksum errors in the RX descriptor instead of
+	 * dropping the packet in SDM.
+	 */
+	val &= ~(SDM_UDPCS | SDM_TCPCS | SDM_IPCS);
+
+	ralink_fe_w32(priv, sdm->con, val);
+
+	/* Priority 2 -> RX ring 1. */
+	ralink_fe_w32(priv, sdm->rring, BIT(2));
+
+	/* Disable SDM TX flow-control mapping. */
+	ralink_fe_w32(priv, sdm->tring, 0);
+}
+
+static void ralink_fe_setup_rx_csum_ctrl(struct ralink_fe_priv *priv)
+{
+	u32 val;
+
+	if (!priv->soc->rx_csum_ctrl)
+		return;
+
+	val = ralink_fe_r32(priv, priv->soc->rx_csum_ctrl);
+	val |= priv->soc->rx_csum_ctrl_set;
+	val &= ~priv->soc->rx_csum_ctrl_clear;
+	ralink_fe_w32(priv, priv->soc->rx_csum_ctrl, val);
 }
 
 static int ralink_fe_phylink_init(struct ralink_fe_priv *priv)
@@ -1879,14 +1914,14 @@ static int ralink_fe_hw_init(struct platform_device *pdev,
 			goto err_clk;
 		}
 	}
-
 	ralink_fe_pdma_sched_init(priv);
-	ralink_fe_setup_rx_csum_ctrl(priv);
-	if (priv->soc->has_tx_csum)
-		ralink_fe_setup_tx_csum_ctrl(priv);
+	ralink_fe_cdm_init(priv);
 
-	if (priv->soc->has_sdm)
-		ralink_fe_setup_sdm(priv);
+	ralink_fe_gdma_init(priv, priv->soc->gdma1_regs);
+	ralink_fe_gdma_init(priv, priv->soc->gdma2_regs);
+
+	ralink_fe_sdm_init(priv);
+	ralink_fe_setup_rx_csum_ctrl(priv);
 
 	return 0;
 
@@ -2079,7 +2114,6 @@ static const struct ralink_fe_reg_map pdma_v1_regs = {
 	.dly_int_cfg = 0x010c,
 	.int_status = 0x0010,
 	.int_enable = 0x0014,
-	.sch_cfg = 0x0108,
 };
 
 static const struct ralink_fe_reg_map pdma_v2_regs = {
@@ -2101,21 +2135,70 @@ static const struct ralink_fe_reg_map pdma_v2_regs = {
 	.dly_int_cfg = 0x0a0c,
 	.int_status = 0x0a20,
 	.int_enable = 0x0a28,
-	.sch_cfg = 0x0a80,
-	.wrr_cfg = 0x0a84,
+};
+
+static const struct ralink_pdma_sched_regs pdmav1_wrr_sched_regs = {
+	.cfg0 = 0x0108,
+};
+
+static const struct ralink_pdma_sched_regs pdmav1_shaper_sched_regs = {
+	.cfg0 = 0x01f4,
+	.cfg1 = 0x01f8,
+};
+
+static const struct ralink_pdma_sched_regs pdmav2_sched_regs = {
+	.cfg0 = 0x0a80,
+	.cfg1 = 0x0a84,
+};
+
+static const struct ralink_cdm_regs cdm_v1_regs = {
+	.csg_cfg = 0x0080,
+	.sch_cfg = 0x0084,
+};
+
+static const struct ralink_gdma_regs gdma1_v1_regs = {
+	.fwd_cfg  = 0x0020,
+	.sch_cfg  = 0x0024,
+	.shpr_cfg = 0x0028,
+};
+
+static const struct ralink_gdma_regs gdma2_v1_regs = {
+	.fwd_cfg  = 0x0060,
+	.sch_cfg  = 0x0064,
+	.shpr_cfg = 0x0068,
+};
+
+static const struct ralink_cdm_regs mt7620_cdm_regs = {
+	.csg_cfg = 0x0400,
+};
+
+static const struct ralink_gdma_regs mt7620_gdma_regs = {
+	.fwd_cfg  = 0x0600,
+	.shpr_cfg = 0x0604,
+	/* no sch_cfg */
+};
+
+static const struct ralink_sdm_regs sdm_v1_regs = {
+	.con	= 0x0c00,
+	.rring	= 0x0c04,
+	.tring	= 0x0c08,
 };
 
 static const struct ralink_fe_soc_data rt2880_data = {
 	.name = "rt2880",
 	.reg_map = &pdma_v1_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_WRR,
+	.pdma_sched_regs = &pdmav1_wrr_sched_regs,
+	.cdm_regs   = &cdm_v1_regs,
+	.gdma1_regs = &gdma1_v1_regs,
+	.gdma2_regs = &gdma2_v1_regs,
+
 	.txqs = 2,
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
-	.dsa_use_oob = false,
-	.has_tx_csum = true,
-	.cdm_csg_cfg = 0x0080,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2127,8 +2210,6 @@ static const struct ralink_fe_soc_data rt2880_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.has_sdm = false,
-	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 	.ppe = RA_PPE_V1,
 	.foe_entries = 1024,
 };
@@ -2136,14 +2217,18 @@ static const struct ralink_fe_soc_data rt2880_data = {
 static const struct ralink_fe_soc_data rt305x_data = {
 	.name = "rt305x",
 	.reg_map = &pdma_v1_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_WRR,
+	.pdma_sched_regs = &pdmav1_wrr_sched_regs,
+	.cdm_regs   = &cdm_v1_regs,
+	.gdma1_regs = &gdma1_v1_regs,
+	.gdma2_regs = &gdma2_v1_regs,
+
 	.txqs = 4,
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
-	.dsa_use_oob = false,
-	.has_tx_csum = true,
-	.cdm_csg_cfg = 0x0080,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2155,8 +2240,6 @@ static const struct ralink_fe_soc_data rt305x_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.has_sdm = false,
-	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 	.ppe = RA_PPE_V1,
 	.foe_entries = 4096,
 };
@@ -2164,14 +2247,18 @@ static const struct ralink_fe_soc_data rt305x_data = {
 static const struct ralink_fe_soc_data rt3883_data = {
 	.name = "rt3883",
 	.reg_map = &pdma_v1_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_RT305X,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_SHAPER,
+	.pdma_sched_regs = &pdmav1_shaper_sched_regs,
+	.cdm_regs   = &cdm_v1_regs,
+	.gdma1_regs = &gdma1_v1_regs,
+	.gdma2_regs = &gdma2_v1_regs,
+
 	.txqs = 4,
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
-	.dsa_use_oob = false,
-	.has_tx_csum = true,
-	.cdm_csg_cfg = 0x0080,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2183,8 +2270,6 @@ static const struct ralink_fe_soc_data rt3883_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.has_sdm = false,
-	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 	.ppe = RA_PPE_V1,
 	.foe_entries = 4096,
 };
@@ -2192,13 +2277,16 @@ static const struct ralink_fe_soc_data rt3883_data = {
 static const struct ralink_fe_soc_data rt5350_data = {
 	.name = "rt5350",
 	.reg_map = &pdma_v2_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_RT5350,
+	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_WRR,
+	.pdma_sched_regs = &pdmav2_sched_regs,
+	.sdm_regs = &sdm_v1_regs,
+
 	.txqs = 4,
 	.rxqs = 2,
 
 	.tx4_port = RA_TX4_NONE,
-	.dsa_use_oob = false,
-	.has_tx_csum = false,
 
 	/* RT5350 SDM:
 	 * clear drop-on-checksum-error bits so errors are reported in RXD.
@@ -2212,22 +2300,24 @@ static const struct ralink_fe_soc_data rt5350_data = {
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,
 
-	.has_sdm = true,
-	.pdma_bt_size = PDMA_BT_SIZE_8WORDS,
 	.ppe = RA_PPE_NONE,
 };
 
 static const struct ralink_fe_soc_data mt7620_data = {
 	.name = "mt7620",
 	.reg_map = &pdma_v2_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_MT7620,
+	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_SHAPER,
+	.pdma_sched_regs = &pdmav2_sched_regs,
+	.cdm_regs   = &mt7620_cdm_regs,
+	.gdma1_regs = &mt7620_gdma_regs,
+
 	.txqs = 4,
 	.rxqs = 2,
 
-	.tx4_port = RA_TX4_FP,
 	.dsa_use_oob = true,
-	.has_tx_csum = true,
-	.cdm_csg_cfg = 0x0400,
+	.tx4_port = RA_TX4_FP,
 	/* MT7620 GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0600,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2240,24 +2330,24 @@ static const struct ralink_fe_soc_data mt7620_data = {
 	.mac_adr_l = 0x13fe4,
 	.mac_adr_h = 0x13ff8,
 
-	.has_sdm = false,
-	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
-
+	/* PPE_V2 not implemented yet */
 	.ppe = RA_PPE_NONE,
-	.ppe = RA_PPE_V2,
 	.foe_entries = 4096,
 };
 
 static const struct ralink_fe_soc_data mt76x8_data = {
 	.name = "mt76x8",
 	.reg_map = &pdma_v2_regs,
-	.pdma_sched = RALINK_PDMA_SCHED_RT5350,
+	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
+
+	.pdma_sched = RALINK_PDMA_SCHED_WRR,
+	.pdma_sched_regs = &pdmav2_sched_regs,
+	.sdm_regs = &sdm_v1_regs,
+
 	.txqs = 4,
 	.rxqs = 2,
 
 	.tx4_port = RA_TX4_NONE,
-	.dsa_use_oob = false,
-	.has_tx_csum = false,
 	/* MT76x8 SDM:
 	 * clear drop-on-checksum-error bits so errors are reported in RXD.
 	 */
@@ -2270,9 +2360,7 @@ static const struct ralink_fe_soc_data mt76x8_data = {
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,
 
-	.has_sdm = true,
 	.ppe = RA_PPE_NONE,
-	.pdma_bt_size = PDMA_BT_SIZE_16WORDS,
 };
 
 static const struct of_device_id ralink_fe_of_match[] = {
