@@ -2,6 +2,7 @@
 #ifndef __RALINK_FE_H
 #define __RALINK_FE_H
 
+#include <linux/dim.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/phylink.h>
@@ -11,8 +12,9 @@
 #define RALINK_FE_TX_RING_SIZE		128
 #define RALINK_FE_RX_RING_SIZE		256
 
-#define RALINK_FE_NAPI_RX		32
-#define RALINK_FE_NAPI_TX		32
+#define RALINK_FE_NAPI_RX		64
+#define RALINK_FE_NAPI_TX		64
+#define RALINK_FE_TX_POLL_QUANTUM	8
 
 #define RALINK_FE_TX_STOP_RESERVE	16
 #define RALINK_FE_TX_WAKE_THRESH	16
@@ -37,6 +39,14 @@
 #define PDMA_RST_DTX_IDX3		BIT(3)
 #define PDMA_RST_DRX_IDX0		BIT(16)
 #define PDMA_RST_DRX_IDX1		BIT(17)
+
+#define FE_DLY_INT_TX_EN	BIT(31)
+#define FE_DLY_INT_TX_PINT	GENMASK(30, 24)
+#define FE_DLY_INT_TX_PTIME	GENMASK(23, 16)
+
+#define FE_DLY_INT_RX_EN	BIT(15)
+#define FE_DLY_INT_RX_PINT	GENMASK(14, 8)
+#define FE_DLY_INT_RX_PTIME	GENMASK(7, 0)
 
 static const u32 tx_rst[] = {
 	PDMA_RST_DTX_IDX0,
@@ -126,23 +136,10 @@ static const u32 rx_rst[] = {
 #define FE_US_CYC_CNT_MASK	GENMASK(15, 8)
 #define FE_US_CYC_CNT_SET(v)	FIELD_PREP(FE_US_CYC_CNT_MASK, (v))
 
-/* SDM – Switch DMA glue block */
-#define SDM_OFFSET		0x0c00
-/* SDM registers */
-#define SDM_CON			(SDM_OFFSET + 0x0000)
-#define SDM_RRING		(SDM_OFFSET + 0x0004)
-#define SDM_TRING		(SDM_OFFSET + 0x0008)
-#define SDM_MAC_ADRL		(SDM_OFFSET + 0x000c)
-#define SDM_MAC_ADRH		(SDM_OFFSET + 0x0010)
-#define SDM_MAC_ADRH_MASK	GENMASK(15, 0)
-
-#define SDM_PDMA_FC		BIT(23)
 #define SDM_PORT_MAP		BIT(22)
-#define SDM_TCI_81XX		BIT(20)
 #define SDM_UDPCS		BIT(18)
 #define SDM_TCPCS		BIT(17)
 #define SDM_IPCS		BIT(16)
-#define SDM_EXT_VLAN		GENMASK(15, 0)
 
 /* GDM */
 #define GDM_ICS_EN		BIT(22)
@@ -150,12 +147,6 @@ static const u32 rx_rst[] = {
 #define GDM_UCS_EN		BIT(20)
 
 #define GDM_SHPR_EN		BIT(24)
-#define GDM_SHPR_BK_SIZE_SHIFT 16
-#define GDM_SHPR_BK_SIZE_MASK  GENMASK(23, 16)
-#define GDM_SHPR_TK_RATE_MASK  GENMASK(13, 0)
-
-#define GDM_SHPR_BK_SIZE(x)    FIELD_PREP(GDM_SHPR_BK_SIZE_MASK, (x))
-#define GDM_SHPR_TK_RATE(x)    FIELD_PREP(GDM_SHPR_TK_RATE_MASK, (x))
 
 /* CDM_CSG_CFG */
 #define CDM_CSG_CFG_INS_VLAN_MASK	GENMASK(31, 16)
@@ -268,11 +259,6 @@ struct ralink_fe_rx_desc {
 #define RALINK_FE_TX_MAP0_PAGE  BIT(0)
 #define RALINK_FE_TX_MAP1_PAGE  BIT(1)
 
-enum ralink_dma_sched_type {
-	RALINK_DMA_SCHED_NONE,
-	RALINK_DMA_SCHED_V1,
-};
-
 enum ra_ppe_version {
 	RA_PPE_NONE = 0,
 	RA_PPE_V1,
@@ -294,10 +280,9 @@ struct ralink_fe_reg_map {
 	u32 rx_base_ptr[RALINK_FE_MAX_RXQ];
 	u32 rx_max_cnt[RALINK_FE_MAX_RXQ];
 	u32 rx_cpu_idx[RALINK_FE_MAX_RXQ];
-	u32 rx_dma_idx[RALINK_FE_MAX_RXQ];
 
-	u32 tx_irq[RALINK_FE_MAX_TXQ];
-	u32 rx_irq[RALINK_FE_MAX_RXQ];
+	u32 tx_dly_irq;
+	u32 rx_dly_irq;
 
 	u32 glo_cfg;
 	u32 rst_idx;
@@ -366,13 +351,6 @@ struct ralink_fe_soc_data {
 	u32			foe_entries;
 };
 
-/* Per-queue NAPI wrapper so poll callbacks can recover the queue index. */
-struct ralink_fe_qnapi {
-	struct napi_struct		napi;
-	struct ralink_fe_priv		*priv;
-	u8				q;
-};
-
 struct ralink_fe_tx_ring {
 	struct ralink_fe_tx_desc	*desc;
 	dma_addr_t			desc_dma;
@@ -382,8 +360,6 @@ struct ralink_fe_tx_ring {
 
 	struct sk_buff			*skb[RALINK_FE_TX_RING_SIZE];
 	u8				map[RALINK_FE_TX_RING_SIZE];
-
-	struct ralink_fe_qnapi		napi;
 
 	struct u64_stats_sync		syncp;
 	u64				packets;
@@ -434,20 +410,18 @@ struct ralink_fe_priv {
 
 	struct clk			*clk;
 	struct reset_control		*rst_fe;
-	struct regmap			*sdm;
 	int				irq;
 	spinlock_t			irq_lock;
 	u32				irq_mask;
 
-	u32				tx_irq[RALINK_FE_MAX_TXQ];
-	u32				rx_irq[RALINK_FE_MAX_RXQ];
 	u32				rx_irq_mask;
+	u32				tx_irq_mask;
 	u32				irq_mask_all;
+	int				tx_poll_next;
 	u8				txqs;
 	u8				rxqs;
 	bool				dsa_use_oob;
 
-	struct mii_bus			*mii_bus;
 	struct mutex			mdio_lock;
 
 	struct phylink			*phylink;
@@ -455,8 +429,23 @@ struct ralink_fe_priv {
 
 	struct ralink_fe_tx_ring	tx_ring[RALINK_FE_MAX_TXQ];
 	struct ralink_fe_rx_ring	rx_ring[RALINK_FE_MAX_RXQ];
+	struct napi_struct		tx_napi_all;
 	struct napi_struct		rx_napi_all;
 	struct metadata_dst		*dsa_meta[RALINK_MAX_DSA_PORTS];
+
+	struct dim rx_dim;
+	struct dim tx_dim;
+	u32 dly_int_cfg;
+
+	u64 rx_dim_events;
+	u64 rx_dim_packets;
+	u64 rx_dim_bytes;
+
+	u64 tx_dim_events;
+	u64 tx_dim_packets;
+	u64 tx_dim_bytes;
+
+	spinlock_t dim_lock;
 
 	u32				msg_enable;
 };

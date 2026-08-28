@@ -140,8 +140,6 @@ static int ralink_fe_mdio_register(struct ralink_fe_priv *priv)
 		return dev_err_probe(priv->dev, ret,
 				     "failed to register FE MDIO bus\n");
 
-	priv->mii_bus = bus;
-
 	return 0;
 }
 
@@ -257,17 +255,179 @@ static int ralink_fe_dma_disable(struct ralink_fe_priv *priv)
 				  1000, 200000);
 }
 
+static const struct ralink_fe_soc_data mt7620_data;
+
 static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 {
-	u32 val;
 	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
+	u32 val;
 
-	ralink_fe_w32(priv, pdma->dly_int_cfg, 0);
+	val = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
 
-//	val = RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
-	val = RX_2B_OFFSET | RX_DMA_EN | TX_DMA_EN | TX_WB_DDONE | priv->soc->pdma_bt_size;
+	if (priv->soc == &mt7620_data)
+		val |= RX_2B_OFFSET;
 
 	ralink_fe_w32(priv, pdma->glo_cfg, val);
+}
+
+static const struct dim_cq_moder ralink_rx_dim_profiles[] = {
+	{ .usec = 20,  .pkts = 4  },  /* known-good baseline */
+	{ .usec = 40,  .pkts = 8  },
+	{ .usec = 80,  .pkts = 16 },
+	{ .usec = 160, .pkts = 24 },
+	{ .usec = 320, .pkts = 32 },
+};
+
+static const struct dim_cq_moder ralink_tx_dim_profiles[] = {
+	{ .usec = 120, .pkts = 32 },
+	{ .usec = 160, .pkts = 48 },
+	{ .usec = 200, .pkts = 64 },  /* known-good center */
+	{ .usec = 240, .pkts = 80 },
+	{ .usec = 320, .pkts = 96 },
+};
+
+static void ralink_fe_dim_rx(struct work_struct *work)
+{
+	struct dim *dim = container_of(work, struct dim, work);
+	struct ralink_fe_priv *priv =
+		container_of(dim, struct ralink_fe_priv, rx_dim);
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
+	struct dim_cq_moder profile;
+	u32 val, pint, ptime, old;
+
+	profile = net_dim_get_rx_irq_moder(priv->ndev, dim);
+
+	pint = min_t(u32, profile.pkts,
+		     FIELD_MAX(FE_DLY_INT_RX_PINT));
+
+	ptime = min_t(u32, DIV_ROUND_UP(profile.usec, 20),
+		      FIELD_MAX(FE_DLY_INT_RX_PTIME));
+
+	spin_lock_bh(&priv->dim_lock);
+
+	old = priv->dly_int_cfg;
+
+	val = old;
+	val &= ~(FE_DLY_INT_RX_PINT | FE_DLY_INT_RX_PTIME);
+	val |= FE_DLY_INT_RX_EN |
+	       FIELD_PREP(FE_DLY_INT_RX_PINT, pint) |
+	       FIELD_PREP(FE_DLY_INT_RX_PTIME, ptime);
+
+	if (val != old) {
+		priv->dly_int_cfg = val;
+		ralink_fe_w32(priv, pdma->dly_int_cfg, val);
+	}
+
+	spin_unlock_bh(&priv->dim_lock);
+
+	dim->state = DIM_START_MEASURE;
+}
+
+static void ralink_fe_dim_tx(struct work_struct *work)
+{
+	struct dim *dim = container_of(work, struct dim, work);
+	struct ralink_fe_priv *priv =
+		container_of(dim, struct ralink_fe_priv, tx_dim);
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
+	struct dim_cq_moder profile;
+	u32 val, old, pint, ptime;
+
+	profile = net_dim_get_tx_irq_moder(priv->ndev, dim);
+
+	pint = min_t(u32, profile.pkts,
+		     FIELD_MAX(FE_DLY_INT_TX_PINT));
+
+	ptime = min_t(u32, DIV_ROUND_UP(profile.usec, 20),
+		      FIELD_MAX(FE_DLY_INT_TX_PTIME));
+
+	spin_lock_bh(&priv->dim_lock);
+
+	old = priv->dly_int_cfg;
+	val = old;
+
+	val &= ~(FE_DLY_INT_TX_PINT | FE_DLY_INT_TX_PTIME);
+	val |= FE_DLY_INT_TX_EN |
+	       FIELD_PREP(FE_DLY_INT_TX_PINT, pint) |
+	       FIELD_PREP(FE_DLY_INT_TX_PTIME, ptime);
+
+	if (val != old) {
+		priv->dly_int_cfg = val;
+		ralink_fe_w32(priv, pdma->dly_int_cfg, val);
+	}
+
+	spin_unlock_bh(&priv->dim_lock);
+
+	dim->state = DIM_START_MEASURE;
+}
+
+static int ralink_fe_dim_init(struct ralink_fe_priv *priv)
+{
+	struct dim_irq_moder *moder;
+	struct dim_cq_moder *rxp, *txp;
+	int ret;
+
+	spin_lock_init(&priv->dim_lock);
+
+	INIT_WORK(&priv->rx_dim.work, ralink_fe_dim_rx);
+	INIT_WORK(&priv->tx_dim.work, ralink_fe_dim_tx);
+
+	ret = net_dim_init_irq_moder(priv->ndev,
+				     DIM_PROFILE_RX | DIM_PROFILE_TX,
+				     DIM_COALESCE_USEC |
+				     DIM_COALESCE_PKTS,
+				     DIM_CQ_PERIOD_MODE_START_FROM_EQE,
+				     DIM_CQ_PERIOD_MODE_START_FROM_EQE,
+				     ralink_fe_dim_rx,
+				     ralink_fe_dim_tx);
+	if (ret)
+		return ret;
+
+	moder = priv->ndev->irq_moder;
+
+	rxp = rcu_dereference_protected(moder->rx_profile, 1);
+	txp = rcu_dereference_protected(moder->tx_profile, 1);
+
+	memcpy(rxp, ralink_rx_dim_profiles,
+	       sizeof(ralink_rx_dim_profiles));
+	memcpy(txp, ralink_tx_dim_profiles,
+	       sizeof(ralink_tx_dim_profiles));
+
+	priv->rx_dim.profile_ix = 0;
+	priv->tx_dim.profile_ix = 2;
+
+	return 0;
+}
+
+static void ralink_fe_dim_hw_setup(struct ralink_fe_priv *priv)
+{
+	const struct ralink_fe_reg_map *pdma = priv->soc->reg_map;
+	struct dim_cq_moder rx, tx;
+	u32 rx_pint, rx_ptime;
+	u32 tx_pint, tx_ptime;
+
+	rx = net_dim_get_rx_irq_moder(priv->ndev, &priv->rx_dim);
+	tx = net_dim_get_tx_irq_moder(priv->ndev, &priv->tx_dim);
+
+	rx_pint = min_t(u32, rx.pkts,
+			FIELD_MAX(FE_DLY_INT_RX_PINT));
+	rx_ptime = min_t(u32, DIV_ROUND_UP(rx.usec, 20),
+			 FIELD_MAX(FE_DLY_INT_RX_PTIME));
+
+	tx_pint = min_t(u32, tx.pkts,
+			FIELD_MAX(FE_DLY_INT_TX_PINT));
+	tx_ptime = min_t(u32, DIV_ROUND_UP(tx.usec, 20),
+			 FIELD_MAX(FE_DLY_INT_TX_PTIME));
+
+	priv->dly_int_cfg =
+		FE_DLY_INT_RX_EN |
+		FIELD_PREP(FE_DLY_INT_RX_PINT, rx_pint) |
+		FIELD_PREP(FE_DLY_INT_RX_PTIME, rx_ptime) |
+		FE_DLY_INT_TX_EN |
+		FIELD_PREP(FE_DLY_INT_TX_PINT, tx_pint) |
+		FIELD_PREP(FE_DLY_INT_TX_PTIME, tx_ptime);
+
+	ralink_fe_w32(priv, pdma->dly_int_cfg,
+		      priv->dly_int_cfg);
 }
 
 static bool ralink_uses_dsa(struct net_device *dev)
@@ -449,26 +609,6 @@ static int ralink_fe_rx_ring_refill(struct ralink_fe_priv *priv, int q)
 	return 0;
 }
 
-static void ralink_fe_napi_enable(struct ralink_fe_priv *priv)
-{
-	int q;
-
-	for (q = 0; q < priv->txqs; q++)
-		napi_enable(&priv->tx_ring[q].napi.napi);
-
-	napi_enable(&priv->rx_napi_all);
-}
-
-static void ralink_fe_napi_disable(struct ralink_fe_priv *priv)
-{
-	int q;
-
-	for (q = 0; q < priv->txqs; q++)
-		napi_disable(&priv->tx_ring[q].napi.napi);
-
-	napi_disable(&priv->rx_napi_all);
-}
-
 static void ralink_fe_tx_ring_reset(struct ralink_fe_priv *priv, int q)
 {
 	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
@@ -548,64 +688,6 @@ static void ralink_fe_dsa_metadata_cleanup(struct ralink_fe_priv *priv)
 		metadata_dst_free(priv->dsa_meta[i]);
 		priv->dsa_meta[i] = NULL;
 	}
-}
-
-static int
-ralink_fe_tx_poll_q(struct ralink_fe_priv *priv, int q, int budget)
-{
-	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
-	struct net_device *ndev = priv->ndev;
-	struct netdev_queue *txq = netdev_get_tx_queue(ndev, q);
-	u16 clean = ring->clean_idx & RALINK_FE_TX_RING_MASK;
-	u16 dtx;
-	int pkts = 0;
-	u32 bytes = 0;
-
-	dtx = (readl(priv->tx_dma_idx[q]) & 0x0fff) & RALINK_FE_TX_RING_MASK;
-	dma_rmb();
-
-	while (clean != dtx && pkts < budget) {
-		struct ralink_fe_tx_desc *d = &ring->desc[clean];
-		struct sk_buff *skb;
-		u32 info2 = READ_ONCE(d->info2);
-		bool done_last = info2 & (TX2_DMA_LS0 | TX2_DMA_LS1);
-
-		ralink_fe_tx_unmap_desc(priv, d, &ring->map[clean]);
-
-		skb = ring->skb[clean];
-		if (done_last && skb) {
-			ring->skb[clean] = NULL;
-			bytes += skb->len;
-			pkts++;
-			consume_skb(skb);
-		}
-
-		clean = (clean + 1) & RALINK_FE_TX_RING_MASK;
-	}
-
-	ring->clean_idx = clean;
-
-	u64_stats_update_begin(&ring->syncp);
-	ring->packets += pkts;
-	ring->bytes += bytes;
-	u64_stats_update_end(&ring->syncp);
-
-	netdev_tx_completed_queue(txq, pkts, bytes);
-
-	if (netif_tx_queue_stopped(txq)) {
-		u16 avail = (clean - ring->cpu_idx -
-			     RALINK_FE_TX_STOP_RESERVE) & RALINK_FE_TX_RING_MASK;
-
-		if (avail >= RALINK_FE_TX_WAKE_THRESH)
-			netif_tx_wake_queue(txq);
-	}
-
-	if (pkts < budget) {
-		if (napi_complete_done(&ring->napi.napi, pkts))
-			ralink_fe_irq_enable(priv, priv->tx_irq[q]);
-	}
-
-	return pkts;
 }
 
 static void ralink_fe_tx_unwind_sg(struct ralink_fe_priv *priv,
@@ -894,11 +976,6 @@ static int ralink_fe_open(struct net_device *ndev)
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
 	int q, err;
 
-	/*
-	 * Populate RX ownership before programming the hardware rings.
-	 * Descriptor memory and page-pool objects themselves persist for
-	 * the lifetime of the device.
-	 */
 	for (q = 0; q < priv->rxqs; q++) {
 		err = ralink_fe_rx_ring_refill(priv, q);
 		if (err)
@@ -910,20 +987,18 @@ static int ralink_fe_open(struct net_device *ndev)
 	priv->dsa_use_oob = priv->soc->dsa_use_oob &&
 			    ralink_uses_dsa(ndev);
 
-	/*
-	 * Start with all FE interrupts masked. NAPI must be ready before
-	 * DMA can begin producing completions.
-	 */
 	priv->irq_mask = 0;
-	ralink_fe_napi_enable(priv);
+
+	net_dim_setting(priv->ndev, &priv->rx_dim, false);
+	net_dim_setting(priv->ndev, &priv->tx_dim, true);
+
+	ralink_fe_dim_hw_setup(priv);
+
+	napi_enable(&priv->tx_napi_all);
+	napi_enable(&priv->rx_napi_all);
 
 	writel(0xffffffff, priv->int_status);
 
-	/*
-	 * Bring up the CPU datapath before enabling PPE. PPE misses and
-	 * exception packets may be redirected to the CPU immediately once
-	 * the engine is started.
-	 */
 	ralink_fe_dma_enable(priv);
 
 	if (priv->ppe) {
@@ -944,20 +1019,14 @@ static int ralink_fe_open(struct net_device *ndev)
 	return 0;
 
 err_dma:
-	/*
-	 * Interrupts are still masked here, but DMA may already own RX
-	 * descriptors. Stop it before disabling NAPI or releasing buffers.
-	 */
 	if (ralink_fe_dma_disable(priv))
-		netdev_warn(ndev, "DMA did not stop cleanly after open failure\n");
+		netdev_warn(ndev,
+			"DMA did not stop cleanly after open failure\n");
 
-	ralink_fe_napi_disable(priv);
+	napi_disable(&priv->tx_napi_all);
+	napi_disable(&priv->rx_napi_all);
 
 err_release_rings:
-	/*
-	 * No TX packet can have been queued yet because the netdev TX
-	 * queues are started only after successful initialization.
-	 */
 	ralink_fe_rings_release(priv);
 
 	return err;
@@ -967,55 +1036,29 @@ static int ralink_fe_stop(struct net_device *ndev)
 {
 	struct ralink_fe_priv *priv = netdev_priv(ndev);
 
-	/*
-	 * Stop link state changes and prevent new packets from entering the
-	 * TX path before quiescing the hardware.
-	 */
 	if (priv->phylink)
 		phylink_stop(priv->phylink);
 	else
 		netif_carrier_off(ndev);
 
-	/*
-	 * Unlike netif_tx_stop_all_queues(), netif_tx_disable() also
-	 * synchronizes against transmit paths currently executing on other
-	 * CPUs.
-	 */
 	netif_tx_disable(ndev);
 
-	/*
-	 * Prevent new interrupt-driven work, then wait for any interrupt
-	 * handler already in progress.
-	 */
 	ralink_fe_irq_disable(priv, priv->irq_mask_all);
 	synchronize_irq(priv->irq);
 
-	/*
-	 * IRQ and NAPI control CPU processing only; they do not stop PDMA
-	 * from accessing descriptors. Stop DMA before releasing ownership
-	 * of any descriptor-backed resources.
-	 */
+	napi_disable(&priv->tx_napi_all);
+	napi_disable(&priv->rx_napi_all);
+
+	cancel_work_sync(&priv->rx_dim.work);
+	cancel_work_sync(&priv->tx_dim.work);
+
 	if (ralink_fe_dma_disable(priv))
-		netdev_warn(ndev, "DMA did not stop cleanly\n");
 
-	/*
-	 * DMA is now quiesced. Wait for any NAPI poll which was already
-	 * running to leave the RX/TX paths.
-	 */
-	ralink_fe_napi_disable(priv);
+	netdev_warn(ndev, "DMA did not stop cleanly\n");
 
-	/*
-	 * RX can no longer enter ra_ppe_offload_check(), so PPE software
-	 * state may now be reset safely.
-	 */
 	if (priv->ppe)
 		ra_ppe_stop(priv->ppe);
 
-	/*
-	 * Hardware and software users are both quiesced. Return all packet
-	 * ownership while retaining descriptor allocations and page pools
-	 * for the next open.
-	 */
 	ralink_fe_rings_release(priv);
 
 	priv->dsa_use_oob = false;
@@ -1211,6 +1254,7 @@ static int ralink_fe_rx_poll_1q(struct napi_struct *napi, int budget)
 	struct ralink_fe_priv *priv =
 		container_of(napi, struct ralink_fe_priv, rx_napi_all);
 	struct ralink_fe_rx_ring *ring = &priv->rx_ring[0];
+	struct dim_sample sample = {};
 	u32 rx_pkts = 0;
 	u32 rx_bytes = 0;
 	int work_done = 0;
@@ -1240,6 +1284,16 @@ static int ralink_fe_rx_poll_1q(struct napi_struct *napi, int budget)
 		writel(ring->cpu_idx, priv->rx_cpu_idx[0]);
 	}
 
+	priv->rx_dim_packets += work_done;
+	priv->rx_dim_bytes += rx_bytes;
+
+	dim_update_sample(priv->rx_dim_events,
+			  priv->rx_dim_packets,
+			  priv->rx_dim_bytes,
+			  &sample);
+
+	net_dim(&priv->rx_dim, &sample);
+
 	if (work_done < budget) {
 		if (napi_complete_done(napi, work_done))
 			ralink_fe_irq_enable(priv, priv->rx_irq_mask);
@@ -1254,6 +1308,7 @@ static int ralink_fe_rx_poll_2q(struct napi_struct *napi, int budget)
 		container_of(napi, struct ralink_fe_priv, rx_napi_all);
 	struct ralink_fe_rx_ring *ring0 = &priv->rx_ring[0];
 	struct ralink_fe_rx_ring *ring1 = &priv->rx_ring[1];
+	struct dim_sample sample = {};
 	u32 rx_pkts0 = 0, rx_bytes0 = 0;
 	u32 rx_pkts1 = 0, rx_bytes1 = 0;
 	bool touched0 = false;
@@ -1319,6 +1374,16 @@ static int ralink_fe_rx_poll_2q(struct napi_struct *napi, int budget)
 			writel(ring1->cpu_idx, priv->rx_cpu_idx[1]);
 	}
 
+	priv->rx_dim_packets += work_done;
+	priv->rx_dim_bytes += rx_bytes0 + rx_bytes1;
+
+	dim_update_sample(priv->rx_dim_events,
+			  priv->rx_dim_packets,
+			  priv->rx_dim_bytes,
+			  &sample);
+
+	net_dim(&priv->rx_dim, &sample);
+
 	if (work_done < budget) {
 		if (napi_complete_done(napi, work_done))
 			ralink_fe_irq_enable(priv, priv->rx_irq_mask);
@@ -1327,22 +1392,124 @@ static int ralink_fe_rx_poll_2q(struct napi_struct *napi, int budget)
 	return work_done;
 }
 
+static int
+ralink_fe_tx_clean_q(struct ralink_fe_priv *priv, int q, int budget)
+{
+	struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
+	struct net_device *ndev = priv->ndev;
+	struct netdev_queue *txq = netdev_get_tx_queue(ndev, q);
+	u16 clean = ring->clean_idx & RALINK_FE_TX_RING_MASK;
+	u16 dtx;
+	int pkts = 0;
+	u32 bytes = 0;
+
+	dtx = (readl(priv->tx_dma_idx[q]) & 0x0fff) &
+	      RALINK_FE_TX_RING_MASK;
+
+	dma_rmb();
+
+	while (clean != dtx && pkts < budget) {
+		struct ralink_fe_tx_desc *d = &ring->desc[clean];
+		struct sk_buff *skb;
+		u32 info2 = READ_ONCE(d->info2);
+		bool done_last = info2 & (TX2_DMA_LS0 | TX2_DMA_LS1);
+
+		ralink_fe_tx_unmap_desc(priv, d, &ring->map[clean]);
+
+		skb = ring->skb[clean];
+		if (done_last && skb) {
+			ring->skb[clean] = NULL;
+			bytes += skb->len;
+			pkts++;
+			consume_skb(skb);
+		}
+
+		clean = (clean + 1) & RALINK_FE_TX_RING_MASK;
+	}
+
+	ring->clean_idx = clean;
+
+	if (pkts) {
+		u64_stats_update_begin(&ring->syncp);
+		ring->packets += pkts;
+		ring->bytes += bytes;
+		u64_stats_update_end(&ring->syncp);
+
+		priv->tx_dim_packets += pkts;
+		priv->tx_dim_bytes += bytes;
+
+		netdev_tx_completed_queue(txq, pkts, bytes);
+	}
+
+	if (netif_tx_queue_stopped(txq)) {
+		u16 avail;
+
+		avail = (clean - ring->cpu_idx -
+			 RALINK_FE_TX_STOP_RESERVE) &
+			RALINK_FE_TX_RING_MASK;
+
+		if (avail >= RALINK_FE_TX_WAKE_THRESH)
+			netif_tx_wake_queue(txq);
+	}
+
+	return pkts;
+}
+
 static int ralink_fe_tx_poll(struct napi_struct *napi, int budget)
 {
-	struct ralink_fe_qnapi *qn =
-		container_of(napi, struct ralink_fe_qnapi, napi);
+	struct ralink_fe_priv *priv =
+		container_of(napi, struct ralink_fe_priv, tx_napi_all);
+	struct dim_sample sample = {};
+	int work_done = 0;
+	unsigned int q = priv->tx_poll_next;
 
-	return ralink_fe_tx_poll_q(qn->priv, qn->q, budget);
+	while (work_done < budget) {
+		bool did_work = false;
+		int i;
+
+		for (i = 0; i < priv->txqs && work_done < budget; i++) {
+			int cur = (q + i) % priv->txqs;
+			int quota;
+			int done;
+
+			quota = min_t(int, RALINK_FE_TX_POLL_QUANTUM,
+				      budget - work_done);
+
+			done = ralink_fe_tx_clean_q(priv, cur, quota);
+			if (done) {
+				work_done += done;
+				did_work = true;
+			}
+		}
+
+		q++;
+		if (q == priv->txqs)
+			q = 0;
+
+		if (!did_work)
+			break;
+	}
+
+	priv->tx_poll_next = q;
+
+	dim_update_sample(priv->tx_dim_events,
+			  priv->tx_dim_packets,
+			  priv->tx_dim_bytes,
+			  &sample);
+	net_dim(&priv->tx_dim, &sample);
+
+	if (work_done < budget) {
+		if (napi_complete_done(napi, work_done))
+			ralink_fe_irq_enable(priv, priv->tx_irq_mask);
+	}
+
+	return work_done;
 }
 
 static irqreturn_t ralink_fe_irq(int irq, void *data)
 {
 	struct ralink_fe_priv *priv = data;
 	u32 st = readl(priv->int_status) & READ_ONCE(priv->irq_mask);
-	irqreturn_t ret = IRQ_NONE;
-	int nq = max_t(int, priv->txqs, priv->rxqs);
-	bool rx = false;
-	int q;
 
 	if (!st)
 		return IRQ_NONE;
@@ -1350,23 +1517,21 @@ static irqreturn_t ralink_fe_irq(int irq, void *data)
 	ralink_fe_irq_disable(priv, st);
 	writel(st, priv->int_status);
 
-	for (q = 0; q < nq; q++) {
-		if (q < priv->rxqs && (st & priv->rx_irq[q])) {
-			rx = true;
-			ret = IRQ_HANDLED;
-		}
+	if (st & priv->rx_irq_mask) {
+		priv->rx_dim_events++;
 
-		if (q < priv->txqs && (st & priv->tx_irq[q])) {
-			if (napi_schedule_prep(&priv->tx_ring[q].napi.napi))
-				__napi_schedule(&priv->tx_ring[q].napi.napi);
-			ret = IRQ_HANDLED;
-		}
+		if (napi_schedule_prep(&priv->rx_napi_all))
+			__napi_schedule(&priv->rx_napi_all);
 	}
 
-	if (rx && napi_schedule_prep(&priv->rx_napi_all))
-		__napi_schedule(&priv->rx_napi_all);
+	if (st & priv->tx_irq_mask) {
+		priv->tx_dim_events++;
 
-	return ret;
+		if (napi_schedule_prep(&priv->tx_napi_all))
+			__napi_schedule(&priv->tx_napi_all);
+	}
+
+	return IRQ_HANDLED;
 }
 
 static void ralink_fe_get_drvinfo(struct net_device *ndev,
@@ -1620,62 +1785,36 @@ static int ralink_fe_alloc_desc(struct ralink_fe_priv *priv)
 static int ralink_fe_init_queues(struct net_device *ndev,
 				 struct ralink_fe_priv *priv)
 {
-	u32 tx_irq_mask = 0;
 	int q;
 
-	priv->rx_irq_mask = 0;
-
-	for (q = 0; q < priv->rxqs; q++) {
-		struct ralink_fe_rx_ring *ring = &priv->rx_ring[q];
-
-		priv->rx_irq_mask |= priv->rx_irq[q];
-		u64_stats_init(&ring->syncp);
-	}
-
-	for (q = 0; q < priv->txqs; q++) {
-		struct ralink_fe_tx_ring *ring = &priv->tx_ring[q];
-
-		tx_irq_mask |= priv->tx_irq[q];
-		u64_stats_init(&ring->syncp);
-	}
-
-	priv->irq_mask_all = priv->rx_irq_mask | tx_irq_mask;
-
-	for (q = 0; q < priv->txqs; q++) {
-		priv->tx_ring[q].napi.priv = priv;
-		priv->tx_ring[q].napi.q = q;
-
-		netif_napi_add_tx_weight(ndev,
-			&priv->tx_ring[q].napi.napi,
-			ralink_fe_tx_poll,
-			RALINK_FE_NAPI_TX);
-	}
-
-	switch (priv->rxqs) {
-	case 1:
-		netif_napi_add_weight(ndev, &priv->rx_napi_all,
-			     ralink_fe_rx_poll_1q,
-			     RALINK_FE_NAPI_RX);
-		break;
-	case 2:
-		netif_napi_add_weight(ndev, &priv->rx_napi_all,
-			     ralink_fe_rx_poll_2q,
-			     RALINK_FE_NAPI_RX);
-		break;
-	default:
+	if (priv->rxqs != 1 && priv->rxqs != 2)
 		return -EINVAL;
-	}
+
+	for (q = 0; q < priv->rxqs; q++)
+		u64_stats_init(&priv->rx_ring[q].syncp);
+
+	for (q = 0; q < priv->txqs; q++)
+		u64_stats_init(&priv->tx_ring[q].syncp);
+
+	netif_napi_add_tx_weight(ndev, &priv->tx_napi_all,
+				 ralink_fe_tx_poll,
+				 RALINK_FE_NAPI_TX);
+
+	if (priv->rxqs == 1)
+		netif_napi_add_weight(ndev, &priv->rx_napi_all,
+				     ralink_fe_rx_poll_1q,
+				     RALINK_FE_NAPI_RX);
+	else
+		netif_napi_add_weight(ndev, &priv->rx_napi_all,
+				     ralink_fe_rx_poll_2q,
+				     RALINK_FE_NAPI_RX);
 
 	return 0;
 }
 
 static void ralink_fe_napi_cleanup(struct ralink_fe_priv *priv)
 {
-	int q;
-
-	for (q = 0; q < priv->txqs; q++)
-		netif_napi_del(&priv->tx_ring[q].napi.napi);
-
+	netif_napi_del(&priv->tx_napi_all);
 	netif_napi_del(&priv->rx_napi_all);
 }
 
@@ -1709,8 +1848,6 @@ static void ralink_fe_pdma_sched_init(struct ralink_fe_priv *priv)
 		break;
 	}
 }
-
-static const struct ralink_fe_soc_data mt7620_data;
 
 static void ralink_fe_cdm_init(struct ralink_fe_priv *priv)
 {
@@ -1978,16 +2115,18 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	for (q = 0; q < priv->txqs; q++) {
 		priv->tx_cpu_idx[q] = priv->base + pdma->tx_cpu_idx[q];
 		priv->tx_dma_idx[q] = priv->base + pdma->tx_dma_idx[q];
-		priv->tx_irq[q] = pdma->tx_irq[q];
 	}
 
-	for (q = 0; q < priv->rxqs; q++) {
+	for (q = 0; q < priv->rxqs; q++)
 		priv->rx_cpu_idx[q] = priv->base + pdma->rx_cpu_idx[q];
-		priv->rx_irq[q] = pdma->rx_irq[q];
-	}
 
 	priv->int_status = priv->base + pdma->int_status;
 	priv->int_enable = priv->base + pdma->int_enable;
+
+	priv->rx_irq_mask = pdma->rx_dly_irq;
+	priv->tx_irq_mask = pdma->tx_dly_irq;
+	priv->irq_mask_all = priv->rx_irq_mask |
+			     priv->tx_irq_mask;
 
 	err = ralink_fe_alloc_desc(priv);
 	if (err)
@@ -2007,19 +2146,20 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	if (err)
 		goto err_pp;
 
-	err = ralink_fe_mdio_register(priv);
+	err = ralink_fe_dim_init(priv);
 	if (err)
 		goto err_dsa_meta;
+
+	err = ralink_fe_mdio_register(priv);
+	if (err)
+		goto err_dim;
 
 	err = ralink_fe_phylink_init(priv);
 	if (err)
-		goto err_dsa_meta;
+		goto err_dim;
 
 	platform_set_drvdata(pdev, priv);
 
-	/*
-	 * Leave the datapath fully quiesced until ndo_open().
-	 */
 	ralink_fe_dma_disable(priv);
 	writel(0xffffffff, priv->int_status);
 	writel(0, priv->int_enable);
@@ -2060,6 +2200,11 @@ err_ppe:
 err_phylink:
 	ralink_fe_phylink_cleanup(priv);
 
+err_dim:
+	rtnl_lock();
+	net_dim_free_irq_moder(priv->ndev);
+	rtnl_unlock();
+
 err_dsa_meta:
 	ralink_fe_dsa_metadata_cleanup(priv);
 
@@ -2079,11 +2224,11 @@ static void ralink_fe_remove(struct platform_device *pdev)
 {
 	struct ralink_fe_priv *priv = platform_get_drvdata(pdev);
 
-	/*
-	 * If the interface is up, unregister_netdev() runs ndo_stop()
-	 * first, which quiesces TX/RX, DMA, NAPI and the PPE hardware.
-	 */
 	unregister_netdev(priv->ndev);
+
+	rtnl_lock();
+	net_dim_free_irq_moder(priv->ndev);
+	rtnl_unlock();
 
 	if (priv->ppe)
 		ra_ppe_deinit(priv->ppe);
@@ -2104,10 +2249,9 @@ static const struct ralink_fe_reg_map pdma_v1_regs = {
 	.rx_base_ptr = { 0x0130 },
 	.rx_max_cnt  = { 0x0134 },
 	.rx_cpu_idx = { 0x0138 },
-	.rx_dma_idx  = { 0x013c },
 
-	.tx_irq = { BIT(8), BIT(9), BIT(10), BIT(11) },
-	.rx_irq = { BIT(2) },
+	.tx_dly_irq = BIT(1),
+	.rx_dly_irq = BIT(0),
 
 	.glo_cfg = 0x0100,
 	.rst_idx = 0x0104,
@@ -2125,10 +2269,9 @@ static const struct ralink_fe_reg_map pdma_v2_regs = {
 	.rx_base_ptr = { 0x0900, 0x0910 },
 	.rx_max_cnt  = { 0x0904, 0x0914 },
 	.rx_cpu_idx = { 0x0908, 0x0918 },
-	.rx_dma_idx  = { 0x090c, 0x091c },
 
-	.tx_irq = { BIT(0), BIT(1), BIT(2), BIT(3) },
-	.rx_irq = { BIT(16), BIT(17) },
+	.tx_dly_irq = BIT(28),
+	.rx_dly_irq = BIT(30),
 
 	.glo_cfg = 0x0a04,
 	.rst_idx = 0x0a08,
