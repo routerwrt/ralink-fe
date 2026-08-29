@@ -6,6 +6,9 @@
 #include <linux/if_bridge.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
+#include <linux/jiffies.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #include <net/dsa.h>
 #include <net/flow_offload.h>
@@ -13,8 +16,8 @@
 
 #include "ralink_fe.h"
 #include "ra_ppe.h"
-#include "ra_ppe_foe.h"
 #include "ra_ppe_offload.h"
+#include "ra_ppe_v1_foe.h"
 #include "ra_ppe_v1_regs.h"
 
 /*
@@ -31,15 +34,15 @@ struct ra_ppe_v1_flow_entry {
 	 * flow tables. RX copies it and supplies the exact tuple learned by
 	 * hardware before committing the FOE entry.
 	 */
-	struct ra_foe_entry bind;
+	struct ra_ppe_v1_foe_entry bind;
 };
 
 struct ra_ppe_v1_output {
 	u16 vlan1;
 	u16 vlan2;
 
-	enum ra_ppe_action vlan1_action;
-	enum ra_ppe_action vlan2_action;
+	enum ra_ppe_v1_action vlan1_action;
+	enum ra_ppe_v1_action vlan2_action;
 
 	bool pppoe;
 	u16 pppoe_id;
@@ -53,28 +56,34 @@ ra_ppe_v1_flow_entry(struct ra_flow_entry *flow)
 	return container_of(flow, struct ra_ppe_v1_flow_entry, flow);
 }
 
+static inline struct ra_ppe_v1_foe_entry *
+ra_ppe_v1_foe_entry(struct ra_ppe *ppe, u32 index)
+{
+	return (struct ra_ppe_v1_foe_entry *)ppe->foe_table + index;
+}
+
 static void
 ra_ppe_v1_flow_key_from_foe(struct ra_flow_key *key,
-			    const struct ra_foe_entry *foe)
+			    const struct ra_ppe_v1_foe_entry *foe)
 {
-	const struct ra_foe_ipv4_hnapt *hnapt = &foe->ipv4_hnapt;
+	const struct ra_ppe_v1_foe_ipv4 *ipv4 = &foe->ipv4;
 	u32 ib1 = READ_ONCE(foe->info_blk1);
 
 	memset(key, 0, sizeof(*key));
 
 	key->n_proto = htons(ETH_P_IP);
-	key->ip_proto = (ib1 & RA_FOE_IB1_UDP) ?
+	key->ip_proto = (ib1 & RA_PPE_V1_IB1_UDP) ?
 			IPPROTO_UDP : IPPROTO_TCP;
 
-	key->src_port = htons(hnapt->sport);
-	key->dst_port = htons(hnapt->dport);
+	key->src_port = htons(ipv4->sport);
+	key->dst_port = htons(ipv4->dport);
 
-	key->src.ipv4 = htonl(hnapt->sip);
-	key->dst.ipv4 = htonl(hnapt->dip);
+	key->src.ipv4 = htonl(ipv4->sip);
+	key->dst.ipv4 = htonl(ipv4->dip);
 }
 
 static bool
-ra_ppe_v1_flow_foe_matches(const struct ra_foe_entry *foe,
+ra_ppe_v1_flow_foe_matches(const struct ra_ppe_v1_foe_entry *foe,
 			   const struct ra_flow_key *key)
 {
 	struct ra_flow_key foe_key;
@@ -85,32 +94,31 @@ ra_ppe_v1_flow_foe_matches(const struct ra_foe_entry *foe,
 }
 
 static bool
-ra_ppe_v1_flow_foe_is_bound(const struct ra_foe_entry *foe,
+ra_ppe_v1_flow_foe_is_bound(const struct ra_ppe_v1_foe_entry *foe,
 			    const struct ra_flow_key *key)
 {
-	if (ra_foe_state(foe) != RA_FOE_STATE_BIND)
+	if (ra_ppe_v1_foe_state(foe) != RA_PPE_V1_FOE_STATE_BIND)
 		return false;
 
+	/*
+	 * The FOE table is coherent DMA memory. Coherency does not imply
+	 * ordering: after observing BIND, order subsequent descriptor reads
+	 * behind that state observation.
+	 */
 	dma_rmb();
 
-	if (!ra_foe_is_ipv4_hnapt(foe))
+	if (!ra_ppe_v1_foe_is_ipv4_hnapt(foe))
 		return false;
 
 	return ra_ppe_v1_flow_foe_matches(foe, key);
 }
 
-static inline struct ra_foe_entry *
-ra_ppe_v1_foe_entry(struct ra_ppe *ppe, u32 index)
-{
-	return (struct ra_foe_entry *)ppe->foe_table + index;
-}
-
 static void
 ra_ppe_v1_foe_commit_locked(struct ra_ppe *ppe, u32 index,
-			    const struct ra_foe_entry *entry)
+			    const struct ra_ppe_v1_foe_entry *entry)
 {
-	struct ra_foe_entry bind;
-	struct ra_foe_entry *dst;
+	struct ra_ppe_v1_foe_entry bind;
+	struct ra_ppe_v1_foe_entry *dst;
 	u32 ib1, final_ib1;
 	u16 timestamp;
 
@@ -123,20 +131,30 @@ ra_ppe_v1_foe_commit_locked(struct ra_ppe *ppe, u32 index,
 
 	timestamp = ra_ppe_r32(ppe, RA_REG_FOE_TS) & 0xffff;
 
+	/*
+	 * Install the current hardware timestamp and construct the final
+	 * BIND state word.
+	 */
 	ib1 = bind.info_blk1;
-	ib1 &= ~(RA_FOE_IB1_BIND_TIMESTAMP |
-		 RA_FOE_IB1_TTL |
-		 RA_FOE_IB1_STATE);
+	ib1 &= ~(RA_PPE_V1_IB1_BIND_TIMESTAMP |
+		 RA_PPE_V1_IB1_TTL |
+		 RA_PPE_V1_IB1_STATE);
 
-	ib1 |= FIELD_PREP(RA_FOE_IB1_BIND_TIMESTAMP, timestamp);
-	ib1 |= RA_FOE_IB1_TTL;
-	ib1 |= FIELD_PREP(RA_FOE_IB1_STATE, RA_FOE_STATE_BIND);
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_BIND_TIMESTAMP, timestamp);
+	ib1 |= RA_PPE_V1_IB1_TTL;
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_STATE,
+			  RA_PPE_V1_FOE_STATE_BIND);
 
 	final_ib1 = ib1;
 
+	/*
+	 * Copy the complete descriptor while its state remains INVALID.
+	 * Publish BIND only after all remaining words are globally visible.
+	 */
 	bind.info_blk1 =
-		(final_ib1 & ~RA_FOE_IB1_STATE) |
-		FIELD_PREP(RA_FOE_IB1_STATE, RA_FOE_STATE_INVALID);
+		(final_ib1 & ~RA_PPE_V1_IB1_STATE) |
+		FIELD_PREP(RA_PPE_V1_IB1_STATE,
+			   RA_PPE_V1_FOE_STATE_INVALID);
 
 	dst = ra_ppe_v1_foe_entry(ppe, index);
 
@@ -150,7 +168,7 @@ ra_ppe_v1_foe_commit_locked(struct ra_ppe *ppe, u32 index,
 static void
 ra_ppe_v1_foe_clear_locked(struct ra_ppe *ppe, u32 index)
 {
-	struct ra_foe_entry *foe;
+	struct ra_ppe_v1_foe_entry *foe;
 
 	lockdep_assert_held(&ppe->lock);
 
@@ -160,7 +178,7 @@ ra_ppe_v1_foe_clear_locked(struct ra_ppe *ppe, u32 index)
 	foe = ra_ppe_v1_foe_entry(ppe, index);
 
 	/*
-	 * PPEv1 invalidation protocol.
+	 * All-zero is PPEv1's INVALID entry representation.
 	 */
 	memset(foe, 0, sizeof(*foe));
 }
@@ -192,19 +210,19 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 		out->dp = 1;
 
 		/*
-		 * Translate the logical flower operation into PPEv1 smart-VLAN
-		 * semantics.
+		 * Non-DSA output. Translate logical flower VLAN operations
+		 * directly into PPEv1 smart-VLAN semantics.
 		 */
 		if (data->vlan.pop && data->vlan.push) {
 			out->vlan1 = data->vlan.push_vid;
-			out->vlan1_action = RA_PPE_ACT_MODIFY;
+			out->vlan1_action = RA_PPE_V1_ACT_MODIFY;
 		} else if (data->vlan.push) {
 			out->vlan1 = data->vlan.push_vid;
-			out->vlan1_action = RA_PPE_ACT_INSERT;
+			out->vlan1_action = RA_PPE_V1_ACT_INSERT;
 		} else if (data->vlan.pop) {
-			out->vlan1_action = RA_PPE_ACT_DELETE;
+			out->vlan1_action = RA_PPE_V1_ACT_DELETE;
 		} else {
-			out->vlan1_action = RA_PPE_ACT_NONE;
+			out->vlan1_action = RA_PPE_V1_ACT_NONE;
 		}
 
 		goto pppoe;
@@ -225,10 +243,10 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 		if (data->vlan.push) {
 			out->vlan1 = data->vlan.push_vid;
 			out->vlan1_action = data->vlan.pop ?
-					    RA_PPE_ACT_MODIFY :
-					    RA_PPE_ACT_INSERT;
+					    RA_PPE_V1_ACT_MODIFY :
+					    RA_PPE_V1_ACT_INSERT;
 
-			out->vlan2_action = RA_PPE_ACT_DELETE;
+			out->vlan2_action = RA_PPE_V1_ACT_DELETE;
 			goto pppoe;
 		}
 
@@ -240,8 +258,8 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 
 		out->vlan1 = pvid;
 		out->vlan1_action = data->vlan.pop ?
-				    RA_PPE_ACT_DELETE :
-				    RA_PPE_ACT_INSERT;
+				    RA_PPE_V1_ACT_DELETE :
+				    RA_PPE_V1_ACT_INSERT;
 
 		goto pppoe;
 	}
@@ -252,20 +270,20 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 		bridge_num = dsa_port_bridge_num_get(dp);
 
 		out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
-		out->vlan1_action = RA_PPE_ACT_INSERT;
+		out->vlan1_action = RA_PPE_V1_ACT_INSERT;
 		out->dp = 1;
 
 		goto pppoe;
 	}
 
 	out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
-	out->vlan1_action = RA_PPE_ACT_INSERT;
+	out->vlan1_action = RA_PPE_V1_ACT_INSERT;
 	out->dp = 2;
 
 pppoe:
 	/*
-	 * Keep PPPoE translation PPEv1-local. The generic flow merely says
-	 * whether Linux requested a PPPOE_PUSH action.
+	 * Keep PPPoE translation PPEv1-local. The generic flow only
+	 * describes the logical PPPOE_PUSH action requested by Linux.
 	 */
 	if (data->pppoe.push) {
 		out->pppoe = true;
@@ -276,69 +294,95 @@ pppoe:
 }
 
 static void
-ra_ppe_v1_build_foe(struct ra_foe_entry *foe,
+ra_ppe_v1_build_foe(struct ra_ppe_v1_foe_entry *foe,
 		    const struct ra_flow_data *data,
 		    const struct ra_ppe_v1_output *out)
 {
+	struct ra_ppe_v1_foe_ipv4 *ipv4 = &foe->ipv4;
+	u32 ib1, ib2;
+
 	memset(foe, 0, sizeof(*foe));
 
-	foe->ipv4_hnapt.bfib1.pkt_type = RA_FOE_IPV4_HNAPT;
-	foe->ipv4_hnapt.bfib1.udp =
-		data->l4proto == IPPROTO_UDP;
-
 	/*
-	 * PPEv1 IPv4 HNAPT tuple fields are stored in CPU order.
+	 * PPEv1 currently accelerates IPv4 HNAPT only. Keep the descriptor
+	 * construction explicit instead of relying on compiler bitfield
+	 * layout.
 	 */
-	foe->ipv4_hnapt.sip = ntohl(data->src_addr.ipv4);
-	foe->ipv4_hnapt.dip = ntohl(data->dst_addr.ipv4);
-	foe->ipv4_hnapt.sport = ntohs(data->src_port);
-	foe->ipv4_hnapt.dport = ntohs(data->dst_port);
+	ib1 = FIELD_PREP(RA_PPE_V1_IB1_PKT_TYPE,
+			 RA_PPE_V1_FOE_IPV4_HNAPT);
 
-	foe->ipv4_hnapt.new_sip = ntohl(data->new_src_addr.ipv4);
-	foe->ipv4_hnapt.new_dip = ntohl(data->new_dst_addr.ipv4);
-	foe->ipv4_hnapt.new_sport = ntohs(data->new_src_port);
-	foe->ipv4_hnapt.new_dport = ntohs(data->new_dst_port);
+	if (data->l4proto == IPPROTO_UDP)
+		ib1 |= RA_PPE_V1_IB1_UDP;
 
-	ra_foe_set_mac(foe->ipv4_hnapt.dmac_hi,
-		       data->eth.h_dest);
-	ra_foe_set_mac(foe->ipv4_hnapt.smac_hi,
-		       data->eth.h_source);
-
-	foe->bfib1.v1 = out->vlan1_action;
-	foe->bfib1.v2 = out->vlan2_action;
-
-	if (out->vlan1_action == RA_PPE_ACT_INSERT ||
-	    out->vlan1_action == RA_PPE_ACT_MODIFY)
-		foe->ipv4_hnapt.vlan1 = out->vlan1;
-
-	if (out->vlan2_action == RA_PPE_ACT_INSERT ||
-	    out->vlan2_action == RA_PPE_ACT_MODIFY)
-		foe->ipv4_hnapt.vlan2 = out->vlan2;
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_VLAN1_ACTION,
+			  out->vlan1_action);
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_VLAN2_ACTION,
+			  out->vlan2_action);
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_SNAP_ACTION,
+			  RA_PPE_V1_ACT_NONE);
 
 	/*
+	 * flow_action provides PPPOE_PUSH but no corresponding PPPOE_POP.
 	 * PPEv1 DELETE is harmless for an unencapsulated routed packet, so
-	 * retain the existing PPEv1 policy here rather than expressing it
-	 * in the generic flow parser.
+	 * retain the existing PPEv1 policy here.
 	 */
-	if (out->pppoe) {
-		foe->bfib1.pppoe = RA_PPE_ACT_INSERT;
-		foe->ipv4_hnapt.pppoe_id = out->pppoe_id;
-	} else {
-		foe->bfib1.pppoe = RA_PPE_ACT_DELETE;
-	}
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_PPPOE_ACTION,
+			  out->pppoe ?
+			  RA_PPE_V1_ACT_INSERT :
+			  RA_PPE_V1_ACT_DELETE);
 
-	foe->ipv4_hnapt.iblk2.fd = 1;
-	foe->ipv4_hnapt.iblk2.dp = out->dp;
-
-	foe->ipv4_hnapt.bfib1.snap = RA_PPE_ACT_NONE;
-	foe->ipv4_hnapt.bfib1.ttl = 1;
-	foe->ipv4_hnapt.bfib1.ka = 1;
-	foe->ipv4_hnapt.bfib1.sta = 0;
+	ib1 |= RA_PPE_V1_IB1_TTL;
+	ib1 |= RA_PPE_V1_IB1_KEEPALIVE;
 
 	/*
-	 * State/timestamp are supplied by ra_ppe_v1_foe_commit_locked().
+	 * STATIC remains clear. State and timestamp are finalized by
+	 * ra_ppe_v1_foe_commit_locked().
+	 *
+	 * INVALID is zero, but encode it explicitly to document the
+	 * publication protocol.
 	 */
-	foe->ipv4_hnapt.bfib1.state = RA_FOE_STATE_INVALID;
+	ib1 |= FIELD_PREP(RA_PPE_V1_IB1_STATE,
+			  RA_PPE_V1_FOE_STATE_INVALID);
+
+	ipv4->info_blk1 = ib1;
+
+	/*
+	 * PPEv1 IPv4 HNAPT tuple fields are stored in CPU order. Keep the
+	 * generic flow representation in network order and convert only at
+	 * the hardware descriptor boundary.
+	 */
+	ipv4->sip = ntohl(data->src_addr.ipv4);
+	ipv4->dip = ntohl(data->dst_addr.ipv4);
+	ipv4->sport = ntohs(data->src_port);
+	ipv4->dport = ntohs(data->dst_port);
+
+	ipv4->new_sip = ntohl(data->new_src_addr.ipv4);
+	ipv4->new_dip = ntohl(data->new_dst_addr.ipv4);
+	ipv4->new_sport = ntohs(data->new_src_port);
+	ipv4->new_dport = ntohs(data->new_dst_port);
+
+	ra_ppe_v1_foe_set_mac(ipv4->dmac_hi, data->eth.h_dest);
+	ra_ppe_v1_foe_set_mac(ipv4->smac_hi, data->eth.h_source);
+
+	if (out->vlan1_action == RA_PPE_V1_ACT_INSERT ||
+	    out->vlan1_action == RA_PPE_V1_ACT_MODIFY)
+		ipv4->vlan1 = out->vlan1;
+
+	if (out->vlan2_action == RA_PPE_V1_ACT_INSERT ||
+	    out->vlan2_action == RA_PPE_V1_ACT_MODIFY)
+		ipv4->vlan2 = out->vlan2;
+
+	if (out->pppoe)
+		ipv4->pppoe_id = out->pppoe_id;
+
+	/*
+	 * Force the packet to the PPEv1 destination selected by output
+	 * topology. All other IB2 policy fields retain their zero defaults.
+	 */
+	ib2 = RA_PPE_V1_IB2_FD |
+	      FIELD_PREP(RA_PPE_V1_IB2_DP, out->dp);
+
+	ipv4->info_blk2 = ib2;
 }
 
 static int
@@ -352,8 +396,8 @@ ra_ppe_v1_flow_prepare(struct ra_ppe *ppe,
 	int err;
 
 	/*
-	 * The generic parser understands IPv6 so PPEv2 can use it later,
-	 * but PPEv1's implementation remains strictly IPv4 HNAPT.
+	 * The generic parser can represent IPv6 for PPEv2, but PPEv1
+	 * remains strictly IPv4 HNAPT.
 	 */
 	if (data->n_proto != htons(ETH_P_IP)) {
 		NL_SET_ERR_MSG_MOD(f->common.extack,
@@ -390,12 +434,14 @@ ra_ppe_v1_flow_remove(struct ra_ppe *ppe,
 		u16 hash = entry->hash;
 
 		/*
-		 * Hardware may already have aged/reused the remembered slot.
-		 * Clear only a BIND entry which still belongs to this flow.
+		 * Hardware may already have aged or reused the remembered
+		 * slot. Clear it only when it is still the BIND belonging to
+		 * this software flow.
 		 */
 		if (hash < ppe->foe_entries &&
-		    ra_ppe_v1_flow_foe_is_bound(ra_ppe_v1_foe_entry(ppe, hash),
-				&entry->key))
+		    ra_ppe_v1_flow_foe_is_bound(
+			    ra_ppe_v1_foe_entry(ppe, hash),
+			    &entry->key))
 			ra_ppe_v1_foe_clear_locked(ppe, hash);
 
 		entry->hash_valid = false;
@@ -408,9 +454,9 @@ static bool
 ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 {
 	struct ra_ppe_v1_flow_entry *v1_entry;
-	struct ra_foe_entry *hw_entry;
+	struct ra_ppe_v1_foe_entry *hw_entry;
+	struct ra_ppe_v1_foe_entry bind;
 	struct ra_flow_entry *entry;
-	struct ra_foe_entry bind;
 	struct ra_flow_key key;
 	unsigned long flags;
 	bool ret = false;
@@ -418,6 +464,11 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	if (!ppe || foe >= ppe->foe_entries)
 		return false;
 
+	/*
+	 * The tuple table is read from RX/NAPI while the TC control path may
+	 * remove entries. RCU protects ra_flow_entry lifetime; ppe->lock
+	 * protects hardware association state and direct FOE access.
+	 */
 	rcu_read_lock();
 
 	spin_lock_irqsave(&ppe->lock, flags);
@@ -425,16 +476,29 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	hw_entry = ra_ppe_v1_foe_entry(ppe, foe);
 
 	if (keepalive) {
-		if (ra_foe_state(hw_entry) != RA_FOE_STATE_BIND)
+		/*
+		 * A keepalive reason must originate from a BIND entry.
+		 */
+		if (ra_ppe_v1_foe_state(hw_entry) !=
+		    RA_PPE_V1_FOE_STATE_BIND)
 			goto out_unlock;
 	} else {
-		if (!ra_foe_is_unbind(hw_entry))
+		/*
+		 * Promotion is valid only for a hardware-learned UNBIND
+		 * entry.
+		 */
+		if (!ra_ppe_v1_foe_is_unbind(hw_entry))
 			goto out_unlock;
 	}
 
+	/*
+	 * The FOE table is coherent DMA memory. After observing the
+	 * hardware-published state, order subsequent descriptor reads
+	 * behind that observation.
+	 */
 	dma_rmb();
 
-	if (!ra_foe_is_ipv4_hnapt(hw_entry))
+	if (!ra_ppe_v1_foe_is_ipv4_hnapt(hw_entry))
 		goto out_unlock;
 
 	ra_ppe_v1_flow_key_from_foe(&key, hw_entry);
@@ -444,6 +508,11 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 		goto out_unlock;
 
 	if (keepalive) {
+		/*
+		 * Accept activity only from the FOE slot currently associated
+		 * with this software flow. This prevents a recycled hardware
+		 * slot from refreshing an unrelated flow.
+		 */
 		if (!entry->hash_valid || entry->hash != foe)
 			goto out_unlock;
 
@@ -454,8 +523,11 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	}
 
 	/*
-	 * A remembered different association remains authoritative while
-	 * that slot is still a matching PPEv1 BIND.
+	 * If software remembers a different FOE slot, treat that association
+	 * as active only while the old slot remains a matching BIND.
+	 *
+	 * Otherwise the old hardware association has aged out or the slot
+	 * has been reused and may be forgotten.
 	 */
 	if (entry->hash_valid && entry->hash != foe) {
 		if (entry->hash < ppe->foe_entries &&
@@ -471,13 +543,19 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	bind = v1_entry->bind;
 
 	/*
-	 * Preserve the exact original tuple learned by PPEv1.
+	 * Preserve the exact original tuple learned by PPEv1. These values
+	 * are already in the hardware's CPU-order FOE representation.
 	 */
-	bind.ipv4_hnapt.sip = hw_entry->ipv4_hnapt.sip;
-	bind.ipv4_hnapt.dip = hw_entry->ipv4_hnapt.dip;
-	bind.ipv4_hnapt.sport = hw_entry->ipv4_hnapt.sport;
-	bind.ipv4_hnapt.dport = hw_entry->ipv4_hnapt.dport;
+	bind.ipv4.sip = hw_entry->ipv4.sip;
+	bind.ipv4.dip = hw_entry->ipv4.dip;
+	bind.ipv4.sport = hw_entry->ipv4.sport;
+	bind.ipv4.dport = hw_entry->ipv4.dport;
 
+	/*
+	 * ppe->lock remains held, so the learned slot cannot be cleared or
+	 * committed by another software path between authorization and BIND
+	 * publication.
+	 */
 	ra_ppe_v1_foe_commit_locked(ppe, foe, &bind);
 
 	entry->hash = foe;

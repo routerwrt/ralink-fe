@@ -6,10 +6,9 @@
 #include <linux/kernel.h>
 
 #include "ra_ppe.h"
-#include "ra_ppe_foe.h"
 #include "ra_ppe_offload.h"
+#include "ra_ppe_v1_foe.h"
 #include "ra_ppe_v1_regs.h"
-
 /*
  * PPEv1 policy defaults from the original Ralink HNAT driver.
  *
@@ -27,7 +26,7 @@
 #define RA_PPE_UDP_TIMEOUT		5
 #define RA_PPE_FIN_TIMEOUT		5
 
-struct ra_ppe_foe_config {
+struct ra_ppe_v1_foe_config {
 	enum ra_foe_tbl_size tbl_size;
 
 	/*
@@ -45,7 +44,8 @@ struct ra_ppe_foe_config {
 };
 
 static int
-ra_ppe_v1_get_foe_config(u32 entries, struct ra_ppe_foe_config *cfg)
+ra_ppe_v1_get_foe_config(u32 entries,
+			 struct ra_ppe_v1_foe_config *cfg)
 {
 	switch (entries) {
 	case 1024:
@@ -210,7 +210,7 @@ ra_ppe_v1_set_bind_age(struct ra_ppe *ppe, u16 tcp_timeout,
 
 static void
 ra_ppe_v1_config_foe(struct ra_ppe *ppe,
-		     const struct ra_ppe_foe_config *cfg)
+		     const struct ra_ppe_v1_foe_config *cfg)
 {
 	u32 mask, val;
 
@@ -300,7 +300,7 @@ static void ra_ppe_v1_foe_clear_all(struct ra_ppe *ppe)
 
 static int ra_ppe_v1_start(struct ra_ppe *ppe)
 {
-	struct ra_ppe_foe_config cfg;
+	struct ra_ppe_v1_foe_config cfg;
 	int err;
 
 	if (!ppe || !ppe->foe_table)
@@ -385,7 +385,7 @@ const struct ra_ppe_ops ra_ppe_v1_ops = {
 	.start			= ra_ppe_v1_start,
 	.stop			= ra_ppe_v1_stop,
 	.offload		= &ra_ppe_v1_offload_ops,
-	.foe_entry_size		= sizeof(struct ra_foe_entry),
-	.cpu_reason_unbind_rate	= RA_PPE_REASON_HIT_UNBIND_RATE_REACH,
-	.cpu_reason_keepalive	= RA_PPE_REASON_HIT_BIND_KEEPALIVE,
+	.foe_entry_size 	= sizeof(struct ra_ppe_v1_foe_entry),
+	.cpu_reason_unbind_rate	= RA_PPE_V1_REASON_HIT_UNBIND_RATE_REACH,
+	.cpu_reason_keepalive	= RA_PPE_V1_REASON_HIT_BIND_KEEPALIVE,
 };
