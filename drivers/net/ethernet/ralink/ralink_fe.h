@@ -247,6 +247,8 @@ struct ralink_fe_rx_desc {
 #define RX4_DMA_AI_GET(_x)	FIELD_GET(RX4_DMA_AI_MASK, (_x))
 #define RX4_DMA_FOE_GET(_x)	FIELD_GET(RX4_DMA_FOE_ENTRY, (_x))
 
+#define RX4_V2_PPE_CPU_REASON	GENMASK(18, 14)
+
 #define MT7620_RX4_PKT_INFO	GENMASK(27, 22)
 #define MT7620_RX4_PKT_L4_ERR	BIT(22)
 #define MT7620_RX4_PKT_L4_VALID	BIT(23)
@@ -348,6 +350,7 @@ struct ralink_fe_soc_data {
 	u32			mac_adr_h;
 
 	enum ra_ppe_version	ppe;
+	const struct ra_ppe_ops *ppe_ops;
 	u32			foe_entries;
 };
 
@@ -393,7 +396,6 @@ struct ralink_fe_rx_ring {
 	u32				refill_fail;
 };
 
-
 struct ralink_fe_priv {
 	void __iomem			*base;
 	void __iomem			*tx_cpu_idx[RALINK_FE_MAX_TXQ];
@@ -405,6 +407,8 @@ struct ralink_fe_priv {
 	struct device			*dev;
 	struct net_device		*ndev;
 	struct ra_ppe			*ppe;
+	u8				ppe_reason_unbind_rate;
+	u8				ppe_reason_keepalive;
 
 	const struct ralink_fe_soc_data	*soc;
 

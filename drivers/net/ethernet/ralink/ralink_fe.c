@@ -24,8 +24,6 @@
 
 #include "ralink_fe.h"
 #include "ra_ppe.h"
-#include "ra_ppe_offload.h"
-#include "ra_ppe_regs.h"
 
 static u32 ralink_fe_r32(struct ralink_fe_priv *priv, u32 reg)
 {
@@ -1132,7 +1130,7 @@ static int ralink_fe_setup_tc(struct net_device *dev,
 	switch (type) {
 	case TC_SETUP_BLOCK:
 	case TC_SETUP_FT:
-		return ra_ppe_setup_tc_block(priv->ppe, dev, type_data);
+		return ra_ppe_setup_tc(priv->ppe, dev, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -1162,6 +1160,8 @@ ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 	dma_addr_t dma;
 	u32 rxinfo2, rxinfo4, len;
 	int ret = 0;
+	u8 reason;
+	u16 foe;
 
 	rxinfo2 = READ_ONCE(d->info2);
 	if (!(rxinfo2 & RX2_DMA_DONE))
@@ -1213,22 +1213,32 @@ ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 			skb_dst_set_noref(skb, &priv->dsa_meta[port]->dst);
 	}
 
-	if ((soc->ppe == RA_PPE_V1) && (rxinfo4 & RX4_DMA_AIS)) {
-		u8 reason = RX4_DMA_AI_GET(rxinfo4);
-		u16 foe = RX4_DMA_FOE_GET(rxinfo4);
+	if (!priv->ppe)
+		goto rx_normal;
 
-		if (reason == RA_PPE_REASON_HIT_UNBIND_RATE_REACH) {
-			if (ra_ppe_offload_check(priv->ppe, foe, false)) {
-				dev_kfree_skb_any(skb);
-				goto rx_rearm;
-			}
-		} else if (reason == RA_PPE_REASON_HIT_BIND_KEEPALIVE) {
-			ra_ppe_offload_check(priv->ppe, foe, true);
+	if (soc->ppe == RA_PPE_V1) {
+		if (!(rxinfo4 & RX4_DMA_AIS))
+			goto rx_normal;
+
+		reason = RX4_DMA_AI_GET(rxinfo4);
+	} else if (soc->ppe == RA_PPE_V2) {
+		reason = FIELD_GET(RX4_V2_PPE_CPU_REASON, rxinfo4);
+	} else {
+		goto rx_normal;
+	}
+	foe = RX4_DMA_FOE_GET(rxinfo4);
+
+	if (reason == priv->ppe_reason_unbind_rate) {
+		if (ra_ppe_offload_check(priv->ppe, foe, false)) {
 			dev_kfree_skb_any(skb);
 			goto rx_rearm;
 		}
+	} else if (reason == priv->ppe_reason_keepalive) {
+		ra_ppe_offload_check(priv->ppe, foe, true);
+		dev_kfree_skb_any(skb);
+		goto rx_rearm;
 	}
-
+rx_normal:
 	skb_record_rx_queue(skb, q);
 	napi_gro_receive(&priv->rx_napi_all, skb);
 
@@ -1919,6 +1929,33 @@ static void ralink_fe_sdm_init(struct ralink_fe_priv *priv)
 	ralink_fe_w32(priv, sdm->tring, 0);
 }
 
+static int ralink_fe_ppe_init(struct ralink_fe_priv *priv)
+{
+	const struct ra_ppe_ops *ops = priv->soc->ppe_ops;
+	struct device *dev = priv->dev;
+	int err;
+
+	if (!ops)
+		return 0;
+
+	priv->ppe = devm_kzalloc(dev, sizeof(*priv->ppe), GFP_KERNEL);
+	if (!priv->ppe)
+		return -ENOMEM;
+
+	err = ra_ppe_init(priv);
+	if (err)
+		return err;
+
+	/*
+	 * Cache the CPU reason values used in the RX hot path rather than
+	 * following priv->ppe->ops for every packet.
+	 */
+	priv->ppe_reason_unbind_rate = ops->cpu_reason_unbind_rate;
+	priv->ppe_reason_keepalive = ops->cpu_reason_keepalive;
+
+	return 0;
+}
+
 static void ralink_fe_setup_rx_csum_ctrl(struct ralink_fe_priv *priv)
 {
 	u32 val;
@@ -2171,17 +2208,9 @@ static int ralink_fe_probe(struct platform_device *pdev)
 		goto err_phylink;
 	}
 
-	if (soc->ppe != RA_PPE_NONE) {
-		priv->ppe = devm_kzalloc(dev, sizeof(*priv->ppe), GFP_KERNEL);
-		if (!priv->ppe) {
-			err = -ENOMEM;
-			goto err_phylink;
-		}
-
-		err = ra_ppe_init(priv);
-		if (err)
-			goto err_phylink;
-	}
+	err = ralink_fe_ppe_init(priv);
+	if (err)
+		goto err_phylink;
 
 	err = register_netdev(ndev);
 	if (err)
@@ -2353,6 +2382,7 @@ static const struct ralink_fe_soc_data rt2880_data = {
 	.mac_adr_h = 0x0030,
 
 	.ppe = RA_PPE_V1,
+	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 1024,
 };
 
@@ -2383,6 +2413,7 @@ static const struct ralink_fe_soc_data rt305x_data = {
 	.mac_adr_h = 0x0030,
 
 	.ppe = RA_PPE_V1,
+	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 4096,
 };
 
@@ -2413,6 +2444,7 @@ static const struct ralink_fe_soc_data rt3883_data = {
 	.mac_adr_h = 0x0030,
 
 	.ppe = RA_PPE_V1,
+	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 4096,
 };
 

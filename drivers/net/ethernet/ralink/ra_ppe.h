@@ -9,18 +9,37 @@
 #include <linux/mutex.h>
 #include <linux/rhashtable.h>
 #include <linux/spinlock.h>
+#include <linux/types.h>
 
+struct net_device;
 struct ralink_fe_priv;
-struct ra_foe_entry;
+struct ra_ppe;
+
+struct ra_ppe_offload_ops;
+
+struct ra_ppe_ops {
+	int (*start)(struct ra_ppe *ppe);
+	void (*stop)(struct ra_ppe *ppe);
+
+	const struct ra_ppe_offload_ops *offload;
+
+	size_t foe_entry_size;
+
+	u8 cpu_reason_unbind_rate;
+	u8 cpu_reason_keepalive;
+};
 
 struct ra_ppe {
 	struct device *dev;
 	struct ralink_fe_priv *fe;
 	void __iomem *base;
 
-	struct ra_foe_entry *foe_table;
+	const struct ra_ppe_ops *ops;
+
+	void *foe_table;
 	dma_addr_t foe_phys;
 	u32 foe_entries;
+	size_t foe_entry_size;
 
 	/*
 	 * Serializes direct manipulation of hardware-visible FOE entries.
@@ -70,13 +89,16 @@ int ra_ppe_start(struct ra_ppe *ppe);
 void ra_ppe_stop(struct ra_ppe *ppe);
 void ra_ppe_deinit(struct ra_ppe *ppe);
 
-void ra_ppe_foe_clear(struct ra_ppe *ppe, u32 index);
-void ra_ppe_foe_clear_locked(struct ra_ppe *ppe, u32 index);
+int ra_ppe_setup_tc(struct ra_ppe *ppe, struct net_device *dev,
+		    void *type_data);
 
-void ra_ppe_foe_commit(struct ra_ppe *ppe, u32 index,
-		       const struct ra_foe_entry *entry);
+bool ra_ppe_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive);
 
-void ra_ppe_foe_commit_locked(struct ra_ppe *ppe, u32 index,
-			      const struct ra_foe_entry *entry);
+#ifdef CONFIG_RALINK_FE_PPE
+extern const struct ra_ppe_ops ra_ppe_v1_ops;
+#define RA_PPE_V1_OPS	(&ra_ppe_v1_ops)
+#else
+#define RA_PPE_V1_OPS	NULL
+#endif
 
 #endif

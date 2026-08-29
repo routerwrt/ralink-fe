@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config NET_VENDOR_RALINK
+	bool "Ralink devices"
+	default y
+	depends on RALINK || COMPILE_TEST
+	help
+	  If you have a Ralink SoC with ethernet, say Y.
+
+if NET_VENDOR_RALINK
+
+config NET_RALINK
+	tristate "Ralink SoC Frame Engine"
+	depends on NET_DSA || !NET_DSA
+	select PAGE_POOL
+	help
+	  This driver supports the frame engine in the Ralink RT2880,
+	  RT305x / RT3883 / RT5350 and Mediatek MT7620 and MT76x8 SoC family.
+
+config RALINK_FE_PPE
+	bool "Ralink PPE hardware offload"
+	depends on NET_RALINK
+	default y
+	help
+	  Enable hardware flow offload support using the Ralink PPE.
+
+endif # NET_VENDOR_RALINK
