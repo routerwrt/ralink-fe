@@ -271,7 +271,7 @@ static void ralink_fe_dma_enable(struct ralink_fe_priv *priv)
 }
 
 static const struct dim_cq_moder ralink_rx_dim_profiles[] = {
-	{ .usec = 20,  .pkts = 4  },  /* known-good baseline */
+	{ .usec = 20,  .pkts = 4  },
 	{ .usec = 40,  .pkts = 8  },
 	{ .usec = 80,  .pkts = 16 },
 	{ .usec = 160, .pkts = 24 },
@@ -279,11 +279,11 @@ static const struct dim_cq_moder ralink_rx_dim_profiles[] = {
 };
 
 static const struct dim_cq_moder ralink_tx_dim_profiles[] = {
-	{ .usec = 120, .pkts = 32 },
-	{ .usec = 160, .pkts = 48 },
-	{ .usec = 200, .pkts = 64 },  /* known-good center */
-	{ .usec = 240, .pkts = 80 },
-	{ .usec = 320, .pkts = 96 },
+	{ .usec = 140, .pkts = 40 },
+	{ .usec = 170, .pkts = 52 },
+	{ .usec = 200, .pkts = 64 },
+	{ .usec = 240, .pkts = 76 },
+	{ .usec = 280, .pkts = 88 },
 };
 
 static void ralink_fe_dim_rx(struct work_struct *work)
@@ -1053,8 +1053,7 @@ static int ralink_fe_stop(struct net_device *ndev)
 	cancel_work_sync(&priv->tx_dim.work);
 
 	if (ralink_fe_dma_disable(priv))
-
-	netdev_warn(ndev, "DMA did not stop cleanly\n");
+		netdev_warn(ndev, "DMA did not stop cleanly\n");
 
 	if (priv->ppe)
 		ra_ppe_stop(priv->ppe);
