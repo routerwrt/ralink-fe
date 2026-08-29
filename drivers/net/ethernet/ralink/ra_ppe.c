@@ -57,7 +57,6 @@ int ra_ppe_init(struct ralink_fe_priv *priv)
 	ppe->fe = priv;
 	ppe->base = priv->base;
 	ppe->foe_entries = priv->soc->foe_entries;
-	ppe->ops = priv->soc->ppe_ops;
 
 	if (!ppe->ops || !ppe->ops->foe_entry_size)
 		return -EINVAL;

@@ -261,12 +261,6 @@ struct ralink_fe_rx_desc {
 #define RALINK_FE_TX_MAP0_PAGE  BIT(0)
 #define RALINK_FE_TX_MAP1_PAGE  BIT(1)
 
-enum ra_ppe_version {
-	RA_PPE_NONE = 0,
-	RA_PPE_V1,
-	RA_PPE_V2,
-};
-
 enum ra_tx4_port {
 	RA_TX4_NONE = 0,
 	RA_TX4_PNQN,
@@ -321,6 +315,16 @@ struct ralink_sdm_regs {
 	u32 tring;
 };
 
+enum ra_ppe_rx_format {
+	RA_PPE_RX_V1,
+	RA_PPE_RX_V2,
+};
+
+struct ra_ppe_match_data {
+	const struct ra_ppe_ops *ops;
+	enum ra_ppe_rx_format rx_format;
+};
+
 struct ralink_fe_soc_data {
 	const char			*name;
 	const struct ralink_fe_reg_map	*reg_map;
@@ -349,8 +353,6 @@ struct ralink_fe_soc_data {
 	u32			mac_adr_l;
 	u32			mac_adr_h;
 
-	enum ra_ppe_version	ppe;
-	const struct ra_ppe_ops *ppe_ops;
 	u32			foe_entries;
 };
 
@@ -409,6 +411,8 @@ struct ralink_fe_priv {
 	struct ra_ppe			*ppe;
 	u8				ppe_reason_unbind_rate;
 	u8				ppe_reason_keepalive;
+	enum ra_ppe_rx_format		ppe_rx_format;
+	bool				dsa_use_oob;
 
 	const struct ralink_fe_soc_data	*soc;
 
@@ -424,7 +428,6 @@ struct ralink_fe_priv {
 	int				tx_poll_next;
 	u8				txqs;
 	u8				rxqs;
-	bool				dsa_use_oob;
 
 	struct mutex			mdio_lock;
 

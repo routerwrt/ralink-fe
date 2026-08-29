@@ -99,9 +99,13 @@ bool ra_ppe_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive);
 
 #ifdef CONFIG_RALINK_FE_PPE
 extern const struct ra_ppe_ops ra_ppe_v1_ops;
+extern const struct ra_ppe_ops ra_ppe_v2_ops;
+
 #define RA_PPE_V1_OPS	(&ra_ppe_v1_ops)
+#define RA_PPE_V2_OPS	(&ra_ppe_v2_ops)
 #else
 #define RA_PPE_V1_OPS	NULL
+#define RA_PPE_V2_OPS	NULL
 #endif
 
 #endif

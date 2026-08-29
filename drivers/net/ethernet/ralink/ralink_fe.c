@@ -1216,12 +1216,12 @@ ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 	if (!priv->ppe)
 		goto rx_normal;
 
-	if (soc->ppe == RA_PPE_V1) {
+	if (priv->ppe_rx_format == RA_PPE_RX_V1) {
 		if (!(rxinfo4 & RX4_DMA_AIS))
 			goto rx_normal;
 
 		reason = RX4_DMA_AI_GET(rxinfo4);
-	} else if (soc->ppe == RA_PPE_V2) {
+	} else if (priv->ppe_rx_format == RA_PPE_RX_V2) {
 		reason = FIELD_GET(RX4_V2_PPE_CPU_REASON, rxinfo4);
 	} else {
 		goto rx_normal;
@@ -1685,9 +1685,6 @@ static void ralink_fe_setup_netdev(struct net_device *ndev,
 	if (priv->soc->cdm_regs)
 		ndev->hw_features |= NETIF_F_IP_CSUM;
 
-	if (priv->soc->ppe != RA_PPE_NONE)
-		ndev->hw_features |= NETIF_F_HW_TC;
-
 	ndev->features = ndev->hw_features;
 	ndev->vlan_features = ndev->hw_features;
 
@@ -1929,9 +1926,10 @@ static void ralink_fe_sdm_init(struct ralink_fe_priv *priv)
 	ralink_fe_w32(priv, sdm->tring, 0);
 }
 
-static int ralink_fe_ppe_init(struct ralink_fe_priv *priv)
+static int
+ralink_fe_ppe_init(struct ralink_fe_priv *priv,
+		   const struct ra_ppe_ops *ops)
 {
-	const struct ra_ppe_ops *ops = priv->soc->ppe_ops;
 	struct device *dev = priv->dev;
 	int err;
 
@@ -1942,9 +1940,14 @@ static int ralink_fe_ppe_init(struct ralink_fe_priv *priv)
 	if (!priv->ppe)
 		return -ENOMEM;
 
+	priv->ppe->ops = ops;
+
 	err = ra_ppe_init(priv);
 	if (err)
 		return err;
+
+	priv->ndev->hw_features |= NETIF_F_HW_TC;
+	priv->ndev->features |= NETIF_F_HW_TC;
 
 	/*
 	 * Cache the CPU reason values used in the RX hot path rather than
@@ -2112,10 +2115,45 @@ static void ralink_fe_hw_cleanup(struct ralink_fe_priv *priv)
 		clk_disable_unprepare(priv->clk);
 }
 
+static const struct ra_ppe_match_data ra_ppe_v1_data = {
+	.ops = RA_PPE_V1_OPS, .rx_format = RA_PPE_RX_V1,
+};
+
+static const struct ra_ppe_match_data ra_ppe_v2_data = {
+	.ops = RA_PPE_V2_OPS, .rx_format = RA_PPE_RX_V2,
+};
+
+static const struct of_device_id ralink_ppe_of_match[] = {
+	{ .compatible = "ralink,rt2880-ppe", .data = &ra_ppe_v1_data },
+	{ .compatible = "ralink,mt7620-ppe", .data = &ra_ppe_v2_data },
+	{ }
+};
+
+static const struct of_device_id *
+ralink_fe_get_ppe_match(struct ralink_fe_priv *priv,
+			struct device_node **ppe_np)
+{
+	const struct of_device_id *match;
+	struct device_node *np;
+
+	for_each_available_child_of_node(priv->dev->of_node, np) {
+		match = of_match_node(ralink_ppe_of_match, np);
+		if (!match)
+			continue;
+
+		*ppe_np = np;
+		return match;
+	}
+
+	return NULL;
+}
+
 static int ralink_fe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	const struct ralink_fe_soc_data *soc;
+	struct device_node *ppe_np;
+	const struct of_device_id *ppe_match;
 	const struct ralink_fe_reg_map *pdma;
 	struct net_device *ndev;
 	struct ralink_fe_priv *priv;
@@ -2208,11 +2246,19 @@ static int ralink_fe_probe(struct platform_device *pdev)
 		goto err_phylink;
 	}
 
-	err = ralink_fe_ppe_init(priv);
-	if (err)
-		goto err_phylink;
+	ppe_match = ralink_fe_get_ppe_match(priv, &ppe_np);
+	if (ppe_match) {
+		const struct ra_ppe_match_data *data = ppe_match->data;
 
-	err = register_netdev(ndev);
+		priv->ppe_rx_format = data->rx_format;
+
+		err = ralink_fe_ppe_init(priv, data->ops);
+		of_node_put(ppe_np);
+		if (err)
+			goto err_phylink;
+	}
+
+	err = register_netdev(priv->ndev);
 	if (err)
 		goto err_ppe;
 
@@ -2381,8 +2427,6 @@ static const struct ralink_fe_soc_data rt2880_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.ppe = RA_PPE_V1,
-	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 1024,
 };
 
@@ -2412,8 +2456,6 @@ static const struct ralink_fe_soc_data rt305x_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.ppe = RA_PPE_V1,
-	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 4096,
 };
 
@@ -2443,8 +2485,6 @@ static const struct ralink_fe_soc_data rt3883_data = {
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
 
-	.ppe = RA_PPE_V1,
-	.ppe_ops = RA_PPE_V1_OPS,
 	.foe_entries = 4096,
 };
 
@@ -2473,8 +2513,6 @@ static const struct ralink_fe_soc_data rt5350_data = {
 
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,
-
-	.ppe = RA_PPE_NONE,
 };
 
 static const struct ralink_fe_soc_data mt7620_data = {
@@ -2504,8 +2542,6 @@ static const struct ralink_fe_soc_data mt7620_data = {
 	.mac_adr_l = 0x13fe4,
 	.mac_adr_h = 0x13ff8,
 
-	/* PPE_V2 not implemented yet */
-	.ppe = RA_PPE_NONE,
 	.foe_entries = 4096,
 };
 
@@ -2533,8 +2569,6 @@ static const struct ralink_fe_soc_data mt76x8_data = {
 
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,
-
-	.ppe = RA_PPE_NONE,
 };
 
 static const struct of_device_id ralink_fe_of_match[] = {
