@@ -133,37 +133,18 @@ struct ra_flow_data {
 	struct ra_flow_pppoe pppoe;
 };
 
-/*
- * Generation-specific translation between a logical Linux flow and the
- * hardware flow-table representation.
- */
 struct ra_ppe_offload_ops {
-	/*
-	 * Validate generation-specific representability and allocate/build
-	 * the private flow object.
-	 *
-	 * On success, *entry must point at the embedded struct ra_flow_entry
-	 * which is the first member of that allocation.
-	 */
 	int (*prepare)(struct ra_ppe *ppe,
 		       struct flow_cls_offload *f,
 		       const struct ra_flow_data *data,
-		       struct ra_flow_entry **entry);
-
-	/*
-	 * Remove any live hardware association for this software flow.
-	 *
-	 * Generic code owns rhashtable removal and RCU freeing.
-	 * ppe->flow_lock is held when this callback is invoked.
-	 */
+		       struct ra_flow_entry **flow);
 	void (*remove)(struct ra_ppe *ppe,
 		       struct ra_flow_entry *entry);
-
-	/*
-	 * Handle a hardware flow-table notification from RX.
-	 */
-	bool (*check)(struct ra_ppe *ppe, u16 index, bool keepalive);
+	bool (*check)(struct ra_ppe *ppe, u16 foe, bool keepalive);
 };
+
+extern const struct ra_ppe_offload_ops ra_ppe_v1_offload_ops;
+extern const struct ra_ppe_offload_ops ra_ppe_v2_offload_ops;
 
 int ra_ppe_setup_tc_block(struct ra_ppe *ppe,
 			  struct net_device *dev,
@@ -180,6 +161,5 @@ struct ra_flow_entry *
 ra_ppe_flow_lookup_tuple(struct ra_ppe *ppe,
 			 const struct ra_flow_key *key);
 
-extern const struct ra_ppe_offload_ops ra_ppe_v1_offload_ops;
 
 #endif

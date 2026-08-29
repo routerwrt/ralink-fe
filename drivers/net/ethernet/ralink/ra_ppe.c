@@ -12,8 +12,11 @@
 
 int ra_ppe_start(struct ra_ppe *ppe)
 {
-	if (!ppe || !ppe->ops || !ppe->ops->start)
+	if (!ppe || !ppe->ops)
 		return -EINVAL;
+
+	if (!ppe->ops->start)
+		return 0;
 
 	return ppe->ops->start(ppe);
 }
@@ -81,7 +84,28 @@ int ra_ppe_init(struct ralink_fe_priv *priv)
 		goto err_offload;
 	}
 
+	/*
+	 * Generation-specific initialization is performed after the FOE
+	 * table has been allocated, since the hardware may need its DMA
+	 * address during initialization.
+	 *
+	 * PPE generations without persistent hardware initialization can
+	 * leave this callback unset.
+	 */
+	if (ppe->ops->init) {
+		err = ppe->ops->init(ppe);
+		if (err)
+			goto err_foe;
+	}
+
 	return 0;
+
+err_foe:
+	dma_free_coherent(ppe->dev, size,
+			  ppe->foe_table, ppe->foe_phys);
+
+	ppe->foe_table = NULL;
+	ppe->foe_phys = 0;
 
 err_offload:
 	ra_ppe_offload_deinit(ppe);
@@ -100,8 +124,19 @@ void ra_ppe_deinit(struct ra_ppe *ppe)
 	 * The FE caller must ensure RX/NAPI has been quiesced before final
 	 * destruction. An RX descriptor queued before ra_ppe_stop() may
 	 * still carry a PPE reason and FOE index.
+	 *
+	 * start/stop are optional runtime datapath operations. PPE
+	 * generations which remain active for the device lifetime leave
+	 * these callbacks unset.
 	 */
 	ra_ppe_stop(ppe);
+
+	/*
+	 * Tear down generation-specific hardware state before destroying
+	 * software flow state or releasing the FOE table.
+	 */
+	if (ppe->ops && ppe->ops->deinit)
+		ppe->ops->deinit(ppe);
 
 	ra_ppe_offload_deinit(ppe);
 

@@ -385,7 +385,7 @@ const struct ra_ppe_ops ra_ppe_v1_ops = {
 	.start			= ra_ppe_v1_start,
 	.stop			= ra_ppe_v1_stop,
 	.offload		= &ra_ppe_v1_offload_ops,
-	.foe_entry_size 	= sizeof(struct ra_ppe_v1_foe_entry),
+	.foe_entry_size		= sizeof(struct ra_ppe_v1_foe_entry),
 	.cpu_reason_unbind_rate	= RA_PPE_V1_REASON_HIT_UNBIND_RATE_REACH,
 	.cpu_reason_keepalive	= RA_PPE_V1_REASON_HIT_BIND_KEEPALIVE,
 };

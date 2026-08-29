@@ -6,3 +6,5 @@ ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe.o
 ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe_offload.o
 ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe_v1.o
 ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe_v1_offload.o
+ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe_v2.o
+ralink-fe-$(CONFIG_RALINK_FE_PPE) += ra_ppe_v2_offload.o

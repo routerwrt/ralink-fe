@@ -18,6 +18,9 @@ struct ra_ppe;
 struct ra_ppe_offload_ops;
 
 struct ra_ppe_ops {
+	int (*init)(struct ra_ppe *ppe);
+	void (*deinit)(struct ra_ppe *ppe);
+
 	int (*start)(struct ra_ppe *ppe);
 	void (*stop)(struct ra_ppe *ppe);
 

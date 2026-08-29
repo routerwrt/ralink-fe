@@ -1,0 +1,200 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _RA_PPE_V2_REGS_H
+#define _RA_PPE_V2_REGS_H
+
+#include <linux/bits.h>
+
+/*
+ * Ralink/MediaTek PPEv2 / HNATv2.
+ *
+ * Register offsets are relative to RALINK_FRAME_ENGINE_BASE.
+ */
+
+#define RA_V2_REG_FOE_TS		0x0010
+
+#define RA_V2_REG_PPE_GLO_CFG		0x0800
+#define RA_V2_REG_PPE_FLOW_CFG		0x0804
+#define RA_V2_REG_PPE_IP_PROT_CHK	0x0808
+#define RA_V2_REG_PPE_IP_PROT_0		0x080c
+#define RA_V2_REG_PPE_IP_PROT_1		0x0810
+#define RA_V2_REG_PPE_IP_PROT_2		0x0814
+#define RA_V2_REG_PPE_IP_PROT_3		0x0818
+
+#define RA_V2_REG_PPE_TB_CFG		0x081c
+#define RA_V2_REG_PPE_TB_BASE		0x0820
+#define RA_V2_REG_PPE_TB_USED		0x0824
+#define RA_V2_REG_PPE_BNDR		0x0828
+#define RA_V2_REG_PPE_BIND_LMT_0	0x082c
+#define RA_V2_REG_PPE_BIND_LMT_1	0x0830
+#define RA_V2_REG_PPE_KA		0x0834
+#define RA_V2_REG_PPE_UNB_AGE		0x0838
+#define RA_V2_REG_PPE_BND_AGE_0		0x083c
+#define RA_V2_REG_PPE_BND_AGE_1		0x0840
+#define RA_V2_REG_PPE_HASH_SEED		0x0844
+
+/*
+ * PPE_GLO_CFG
+ *
+ * Do not assign PPEv1/MT7621 engine-enable semantics to bit 0 here.
+ */
+#define RA_PPE_V2_TTL0_DROP		BIT(4)
+
+/*
+ * PPE_FLOW_CFG
+ */
+#define RA_PPE_V2_FBC_FOE		BIT(0)
+#define RA_PPE_V2_FMC_FOE		BIT(1)
+#define RA_PPE_V2_FUC_FOE		BIT(2)
+
+#define RA_PPE_V2_IPV6_3T_ROUTE_EN	BIT(8)
+#define RA_PPE_V2_IPV6_5T_ROUTE_EN	BIT(9)
+#define RA_PPE_V2_IPV6_6RD_EN		BIT(10)
+
+#define RA_PPE_V2_IPV4_NAT_EN		BIT(12)
+#define RA_PPE_V2_IPV4_NAPT_EN		BIT(13)
+#define RA_PPE_V2_IPV4_DSLITE_EN	BIT(14)
+
+#define RA_PPE_V2_IP_PROT_CHK_BLIST	BIT(16)
+#define RA_PPE_V2_IPV4_NAT_FRAG_EN	BIT(17)
+#define RA_PPE_V2_IPV6_HASH_FLABEL	BIT(18)
+#define RA_PPE_V2_IPV4_HASH_GRE_KEY	BIT(19)
+#define RA_PPE_V2_IPV6_HASH_GRE_KEY	BIT(20)
+
+/*
+ * PPE_TB_CFG
+ */
+#define RA_PPE_V2_TB_ENTRY_NUM		GENMASK(2, 0)
+#define RA_PPE_V2_TB_ENTRY_SIZE		BIT(3)
+#define RA_PPE_V2_TB_MISS_ACTION	GENMASK(5, 4)
+
+#define RA_PPE_V2_TB_NTU_AGE_EN		BIT(7)
+#define RA_PPE_V2_TB_UNB_AGE_EN		BIT(8)
+#define RA_PPE_V2_TB_TCP_AGE_EN		BIT(9)
+#define RA_PPE_V2_TB_UDP_AGE_EN		BIT(10)
+#define RA_PPE_V2_TB_FIN_AGE_EN		BIT(11)
+
+#define RA_PPE_V2_TB_KA_CFG		GENMASK(13, 12)
+#define RA_PPE_V2_TB_HASH_MODE		GENMASK(15, 14)
+#define RA_PPE_V2_TB_XMODE		GENMASK(19, 18)
+
+enum ra_ppe_v2_tbl_size {
+	RA_PPE_V2_TBL_1K,
+	RA_PPE_V2_TBL_2K,
+	RA_PPE_V2_TBL_4K,
+	RA_PPE_V2_TBL_8K,
+	RA_PPE_V2_TBL_16K,
+};
+
+enum ra_ppe_v2_entry_size {
+	RA_PPE_V2_ENTRY_64B = 0,
+	RA_PPE_V2_ENTRY_80B = 1,
+};
+
+enum ra_ppe_v2_miss_action {
+	RA_PPE_V2_MISS_DROP		= 0,
+	RA_PPE_V2_MISS_DROP2		= 1,
+	RA_PPE_V2_MISS_CPU		= 2,
+	RA_PPE_V2_MISS_CPU_BUILD	= 3,
+};
+
+enum ra_ppe_v2_hash_mode {
+	RA_PPE_V2_HASH_MODE_0,
+	RA_PPE_V2_HASH_MODE_1,
+	RA_PPE_V2_HASH_MODE_2,
+	RA_PPE_V2_HASH_MODE_3,
+};
+
+/*
+ * HNATv2 keepalive mode.
+ *
+ * 0 = disabled
+ * 1 = unicast old-header
+ * 2 = multicast new-header
+ * 3 = duplicate old-header
+ *
+ * Use unicast old-header for normal unicast flow activity tracking.
+ * Multicast keepalive is outside the current driver scope.
+ */
+enum ra_ppe_v2_ka_mode {
+	RA_PPE_V2_KA_DISABLE		= 0,
+	RA_PPE_V2_KA_UC_OLD_HDR	= 1,
+	RA_PPE_V2_KA_MC_NEW_HDR	= 2,
+	RA_PPE_V2_KA_DUP_OLD_HDR	= 3,
+};
+
+/*
+ * PPE_KA
+ */
+#define RA_PPE_V2_KA_TIMER		GENMASK(15, 0)
+#define RA_PPE_V2_KA_TCP		GENMASK(23, 16)
+#define RA_PPE_V2_KA_UDP		GENMASK(31, 24)
+
+/*
+ * PPE_UNB_AGE
+ */
+#define RA_PPE_V2_UNB_AGE_DELTA		GENMASK(7, 0)
+#define RA_PPE_V2_UNB_AGE_MIN_PKT	GENMASK(31, 16)
+
+/*
+ * PPE_BND_AGE_0
+ */
+#define RA_PPE_V2_BND_AGE0_UDP		GENMASK(15, 0)
+#define RA_PPE_V2_BND_AGE0_NTU		GENMASK(31, 16)
+
+/*
+ * PPE_BND_AGE_1
+ */
+#define RA_PPE_V2_BND_AGE1_TCP		GENMASK(15, 0)
+#define RA_PPE_V2_BND_AGE1_FIN		GENMASK(31, 16)
+
+/*
+ * PPE_BIND_LMT_0
+ */
+#define RA_PPE_V2_BIND_LMT0_QUARTER	GENMASK(9, 0)
+#define RA_PPE_V2_BIND_LMT0_HALF	GENMASK(25, 16)
+
+/*
+ * PPE_BIND_LMT_1
+ */
+#define RA_PPE_V2_BIND_LMT1_FULL	GENMASK(13, 0)
+#define RA_PPE_V2_BIND_LMT1_NTU_KA	GENMASK(23, 16)
+
+/*
+ * PPE_BNDR
+ */
+#define RA_PPE_V2_BIND_RATE		GENMASK(15, 0)
+#define RA_PPE_V2_PRE_BIND_PERIOD	GENMASK(31, 16)
+
+/*
+ * HNATv2 default hash seed used by the vendor implementation.
+ */
+#define RA_PPE_V2_HASH_SEED		0x12345678
+
+/*
+ * PPEv2 CPU reasons.
+ */
+enum ra_ppe_v2_cpu_reason {
+	RA_PPE_V2_REASON_TTL_0				= 0x02,
+	RA_PPE_V2_REASON_HAS_OPTION_HEADER		= 0x03,
+	RA_PPE_V2_REASON_NO_FLOW_ASSIGNED		= 0x07,
+	RA_PPE_V2_REASON_IPV4_FRAGMENT			= 0x08,
+	RA_PPE_V2_REASON_IPV4_HNAPT_DSLITE_FRAGMENT	= 0x09,
+	RA_PPE_V2_REASON_IPV4_HNAPT_DSLITE_NO_L4	= 0x0a,
+	RA_PPE_V2_REASON_IPV6_5T_6RD_NO_L4		= 0x0b,
+	RA_PPE_V2_REASON_TCP_FIN_SYN_RST		= 0x0c,
+	RA_PPE_V2_REASON_UN_HIT				= 0x0d,
+	RA_PPE_V2_REASON_HIT_UNBIND			= 0x0e,
+	RA_PPE_V2_REASON_HIT_UNBIND_RATE_REACH		= 0x0f,
+	RA_PPE_V2_REASON_HIT_BIND_TCP_FIN		= 0x10,
+	RA_PPE_V2_REASON_HIT_BIND_TTL_1			= 0x11,
+	RA_PPE_V2_REASON_HIT_BIND_VLAN_VIOLATION	= 0x12,
+	RA_PPE_V2_REASON_HIT_BIND_KA_UC_OLD_HDR		= 0x13,
+	RA_PPE_V2_REASON_HIT_BIND_KA_MC_NEW_HDR		= 0x14,
+	RA_PPE_V2_REASON_HIT_BIND_KA_DUP_OLD_HDR	= 0x15,
+	RA_PPE_V2_REASON_HIT_BIND_FORCE_TO_CPU		= 0x16,
+	RA_PPE_V2_REASON_HIT_BIND_OPTION_HEADER		= 0x17,
+	RA_PPE_V2_REASON_HIT_BIND_EXCEED_MTU		= 0x1c,
+	RA_PPE_V2_REASON_HIT_BIND_MULTICAST_TO_CPU	= 0x1f,
+};
+
+#endif
