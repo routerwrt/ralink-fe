@@ -7,7 +7,6 @@
 
 #include "ralink_fe.h"
 #include "ra_ppe.h"
-#include "ra_ppe_foe.h"
 #include "ra_ppe_offload.h"
 
 int ra_ppe_start(struct ra_ppe *ppe)
