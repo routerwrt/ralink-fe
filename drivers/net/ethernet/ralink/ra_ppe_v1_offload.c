@@ -555,6 +555,18 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	bind.ipv4.dport = hw_entry->ipv4.dport;
 
 	/*
+	 * Better flow spreading, similar to the DSA driver's TX queue
+	 * distribution. Flow offload bypasses netdev TX queue selection,
+	 * so derive a stable CoS class from the actual FOE slot.
+	 */
+	if (ppe->ralink_dsa) {
+		u16 pcp = (foe & 0x3) << 1;
+
+		bind.ipv4.vlan1 &= ~VLAN_PRIO_MASK;
+		bind.ipv4.vlan1 |= pcp << VLAN_PRIO_SHIFT;
+	}
+
+	/*
 	 * ppe->lock remains held, so the learned slot cannot be cleared or
 	 * committed by another software path between authorization and BIND
 	 * publication.
