@@ -712,6 +712,48 @@ static void ralink_fe_tx_unwind_sg(struct ralink_fe_priv *priv,
 	}
 }
 
+static void
+ralink_fe_vlan_id_write_locked(struct ralink_fe_priv *priv, u8 idx, u16 vid)
+{
+	u32 reg, shift, val;
+
+	reg = priv->soc->vlan_id_base + (idx >> 1) * 4;
+	shift = (idx & 1) ? 0 : 16;
+
+	val = ralink_fe_r32(priv, reg);
+	val &= ~(VLAN_VID_MASK << shift);
+	val |= (vid & VLAN_VID_MASK) << shift;
+	ralink_fe_w32(priv, reg, val);
+}
+
+static u8
+ralink_fe_vlan_cache_alloc(struct ralink_fe_priv *priv, u16 vid)
+{
+	u8 vidx;
+
+	spin_lock_bh(&priv->vlan_lock);
+
+	vidx = priv->vlan_idx[vid];
+	if (vidx)
+		goto out;
+
+	if (priv->vlan_next_idx >= RALINK_FE_VLAN_SLOTS)
+		goto out;
+
+	vidx = priv->vlan_next_idx++;
+
+	ralink_fe_vlan_id_write_locked(priv, vidx, vid);
+
+	/* Zero means uncached, so store the hardware index plus one. */
+	vidx++;
+	WRITE_ONCE(priv->vlan_idx[vid], vidx);
+
+out:
+	spin_unlock_bh(&priv->vlan_lock);
+
+	return vidx;
+}
+
 static netdev_tx_t
 ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 			 struct ralink_fe_tx_ring *ring,
@@ -730,14 +772,26 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	int pn = (q & BIT(1)) ? 2 : 1;
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
+	u8 vidx, vpri;
 
-	/*
-	 * For now skip HW handling until plumbing is ready
-	 */
 	if (skb_vlan_tag_present(skb)) {
-		skb = __vlan_hwaccel_push_inside(skb);
-		if (!skb)
-			goto err_drop;
+		u16 vid = skb_vlan_tag_get_id(skb);
+
+		vidx = READ_ONCE(priv->vlan_idx[vid]);
+
+		if (!vidx && (priv->soc->tx4_port != RA_TX4_NONE))
+			vidx = ralink_fe_vlan_cache_alloc(priv, vid);
+
+		if (vidx) {
+			vpri = skb_vlan_tag_get_prio(skb);
+			txinfo |= TX4_DMA_INSV |
+				   FIELD_PREP(TX4_DMA_VPRI, vpri) |
+				   FIELD_PREP(TX4_DMA_VIDX, vidx - 1);
+		} else {
+			skb = __vlan_hwaccel_push_inside(skb);
+			if (!skb)
+				goto err_drop;
+		}
 	}
 
 	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
@@ -749,7 +803,7 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	}
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
-		txinfo = TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
+		txinfo |= TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
 
 	if (priv->soc->tx4_port == RA_TX4_PNQN)
 		txinfo |= TX4_DMA_PN(pn) | TX4_DMA_QN(qn);
@@ -818,15 +872,27 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	int pn = (q & BIT(1)) ? 2 : 1;
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
+	u8 vidx, vpri;
 
-	/*
-	 * For now skip HW handling until plumbing is ready
-	 */
 	if (skb_vlan_tag_present(skb)) {
-		skb = __vlan_hwaccel_push_inside(skb);
-		if (!skb)
-			goto err_drop;
+		u16 vid = skb_vlan_tag_get_id(skb);
+		vidx = READ_ONCE(priv->vlan_idx[vid]);
+
+		if (!vidx && (priv->soc->tx4_port != RA_TX4_NONE))
+			vidx = ralink_fe_vlan_cache_alloc(priv, vid);
+
+		if (vidx) {
+			vpri = skb_vlan_tag_get_prio(skb);
+			txinfo |= TX4_DMA_INSV |
+				   FIELD_PREP(TX4_DMA_VPRI, vpri) |
+				   FIELD_PREP(TX4_DMA_VIDX, vidx - 1);
+		} else {
+			skb = __vlan_hwaccel_push_inside(skb);
+			if (!skb)
+				goto err_drop;
+		}
 	}
+
 	/*
 	 * PDMA supports scatter-gather TX. Each descriptor carries up to
 	 * two DMA segments, so a packet may span multiple descriptors.
@@ -1002,6 +1068,9 @@ static int ralink_fe_open(struct net_device *ndev)
 		if (priv->ppe)
 			priv->ppe->ralink_dsa = true;
 	}
+
+	memset(priv->vlan_idx, 0, VLAN_N_VID);
+	priv->vlan_next_idx = 0;
 
 	ralink_fe_program_rings(priv);
 
@@ -1731,6 +1800,9 @@ static void ralink_fe_setup_netdev(struct net_device *ndev,
 	if (priv->soc->cdm_regs)
 		ndev->hw_features |= NETIF_F_IP_CSUM;
 
+	if (priv->soc->tx4_port != RA_TX4_NONE)
+		ndev->hw_features |= NETIF_F_HW_VLAN_CTAG_TX;
+
 	ndev->features = ndev->hw_features;
 	ndev->vlan_features = ndev->hw_features;
 
@@ -2226,6 +2298,13 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	priv->txqs = soc->txqs;
 	priv->rxqs = soc->rxqs;
 
+	priv->vlan_idx = devm_kcalloc(dev, VLAN_N_VID,
+				      sizeof(*priv->vlan_idx),
+				      GFP_KERNEL);
+	if (!priv->vlan_idx)
+		return -ENOMEM;
+
+	spin_lock_init(&priv->vlan_lock);
 	spin_lock_init(&priv->irq_lock);
 	mutex_init(&priv->mdio_lock);
 
@@ -2462,6 +2541,7 @@ static const struct ralink_fe_soc_data rt2880_data = {
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
+	.vlan_id_base = 0xa8,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2491,6 +2571,7 @@ static const struct ralink_fe_soc_data rt305x_data = {
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
+	.vlan_id_base = 0xa8,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2520,6 +2601,7 @@ static const struct ralink_fe_soc_data rt3883_data = {
 	.rxqs = 1,
 
 	.tx4_port = RA_TX4_PNQN,
+	.vlan_id_base = 0xa8,
 	/* RT305x GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0020,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
@@ -2580,6 +2662,7 @@ static const struct ralink_fe_soc_data mt7620_data = {
 	.rx4_sp_valid = true,
 
 	.tx4_port = RA_TX4_FP,
+	.vlan_id_base = 0x430,
 	/* MT7620 GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0600,
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,

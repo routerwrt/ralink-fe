@@ -20,6 +20,7 @@
 #define RALINK_FE_TX_WAKE_THRESH	16
 
 #define RALINK_MAX_DSA_PORTS		8
+#define RALINK_FE_VLAN_SLOTS		16
 
 /* Power-of-2 masks */
 #define RALINK_FE_TX_RING_MASK		(RALINK_FE_TX_RING_SIZE - 1)
@@ -206,6 +207,10 @@ struct ralink_fe_tx_desc {
 #define TX4_DMA_PN_MASK		GENMASK(26, 24)
 #define TX4_DMA_QN_MASK		GENMASK(18, 16)
 
+#define TX4_DMA_INSV		BIT(7)
+#define TX4_DMA_VPRI		GENMASK(6, 4)
+#define TX4_DMA_VIDX		GENMASK(3, 0)
+
 #define TX4_DMA_PN(_x)		FIELD_PREP(TX4_DMA_PN_MASK, (_x))
 #define TX4_DMA_QN(_x)		FIELD_PREP(TX4_DMA_QN_MASK, (_x))
 
@@ -352,6 +357,7 @@ struct ralink_fe_soc_data {
 	bool			rx4_v2;
 	bool			rx4_sp_valid;
 	u32			tx4_port;
+	u32			vlan_id_base;
 
 	u32			rx_csum_ctrl;
 	u32			rx_csum_ctrl_set;
@@ -422,6 +428,9 @@ struct ralink_fe_priv {
 	u8				ppe_reason_keepalive;
 	bool				rx4_v2;
 	bool				rx4_sp_valid;
+	u8				*vlan_idx;
+	u8				vlan_next_idx;
+	spinlock_t			vlan_lock;
 
 	const struct ralink_fe_soc_data	*soc;
 
