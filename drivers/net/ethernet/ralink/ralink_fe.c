@@ -432,7 +432,7 @@ static bool ralink_uses_dsa(struct net_device *dev)
 {
 #if IS_ENABLED(CONFIG_NET_DSA)
 	return netdev_uses_dsa(dev) &&
-	       dev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RALINK;
+	       dev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_RALINK_8021Q;
 #else
 	return false;
 #endif
@@ -645,12 +645,9 @@ static void ralink_fe_rings_release(struct ralink_fe_priv *priv)
 		ralink_fe_rx_release_ring(priv, q);
 }
 
-static int ralink_fe_dsa_metadata_init(struct ralink_fe_priv *priv)
+static int ralink_fe_dsa_metadata_alloc(struct ralink_fe_priv *priv)
 {
 	int i;
-
-	if (!priv->soc->dsa_use_oob)
-		return 0;
 
 	for (i = 0; i < ARRAY_SIZE(priv->dsa_meta); i++) {
 		struct metadata_dst *md_dst;
@@ -675,7 +672,7 @@ err_free:
 	return -ENOMEM;
 }
 
-static void ralink_fe_dsa_metadata_cleanup(struct ralink_fe_priv *priv)
+static void ralink_fe_dsa_metadata_free(struct ralink_fe_priv *priv)
 {
 	int i;
 
@@ -980,10 +977,19 @@ static int ralink_fe_open(struct net_device *ndev)
 			goto err_release_rings;
 	}
 
+	if (ralink_uses_dsa(ndev)) {
+		err = ralink_fe_dsa_metadata_alloc(priv);
+		if (err)
+			goto err_release_rings;
+
+		if (priv->ppe)
+			priv->ppe->ralink_dsa = true;
+	}
+
 	ralink_fe_program_rings(priv);
 
-	priv->dsa_use_oob = priv->soc->dsa_use_oob &&
-			    ralink_uses_dsa(ndev);
+	priv->rx4_v2 = priv->soc->rx4_v2;
+	priv->rx4_sp_valid = priv->soc->rx4_sp_valid;
 
 	priv->irq_mask = 0;
 
@@ -1017,6 +1023,7 @@ static int ralink_fe_open(struct net_device *ndev)
 	return 0;
 
 err_dma:
+	ralink_fe_dsa_metadata_free(priv);
 	if (ralink_fe_dma_disable(priv))
 		netdev_warn(ndev,
 			"DMA did not stop cleanly after open failure\n");
@@ -1053,12 +1060,13 @@ static int ralink_fe_stop(struct net_device *ndev)
 	if (ralink_fe_dma_disable(priv))
 		netdev_warn(ndev, "DMA did not stop cleanly\n");
 
-	if (priv->ppe)
+	if (priv->ppe) {
 		ra_ppe_stop(priv->ppe);
+		priv->ppe->ralink_dsa = false;
+	}
 
 	ralink_fe_rings_release(priv);
-
-	priv->dsa_use_oob = false;
+	ralink_fe_dsa_metadata_free(priv);
 
 	return 0;
 }
@@ -1160,6 +1168,7 @@ ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 	dma_addr_t dma;
 	u32 rxinfo2, rxinfo4, len;
 	int ret = 0;
+	u8 port;
 	u8 reason;
 	u16 foe;
 
@@ -1206,27 +1215,47 @@ ralink_fe_rx_consume_one(struct ralink_fe_priv *priv, int q)
 
 	skb->protocol = eth_type_trans(skb, priv->ndev);
 
-	if (priv->dsa_use_oob) {
-		unsigned int port = MT7620_DMA_SP_GET(rxinfo4);
+	if (!priv->rx4_sp_valid)
+		goto check_ppe;
 
-		if (port < ARRAY_SIZE(priv->dsa_meta) && priv->dsa_meta[port])
-			skb_dst_set_noref(skb, &priv->dsa_meta[port]->dst);
+	port = priv->rx4_v2 ? RX4_V2_SP_GET(rxinfo4) :
+			      RX4_V1_SP_GET(rxinfo4);
+
+	if (!priv->rx4_v2 && port) {
+		struct vlan_ethhdr *vh;
+		u16 tci;
+
+		vh = skb_vlan_eth_hdr(skb);
+		tci = ntohs(vh->h_vlan_TCI);
+
+		memmove(skb->data + VLAN_HLEN,
+		        skb->data,
+		        ETH_ALEN * 2);
+
+		skb_pull(skb, VLAN_HLEN);
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), tci);
 	}
 
+	if ((priv->rx4_v2 || port) &&
+	    port < ARRAY_SIZE(priv->dsa_meta) &&
+	    priv->dsa_meta[port]) {
+		dev_info(priv->dev, "rx:port %d\n", port);
+		skb_dst_set_noref(skb, &priv->dsa_meta[port]->dst);
+	    }
+check_ppe:
 	if (!priv->ppe)
 		goto rx_normal;
 
-	if (priv->ppe_rx_format == RA_PPE_RX_V1) {
-		if (!(rxinfo4 & RX4_DMA_AIS))
+	if (!priv->rx4_v2) {
+		if (!(rxinfo4 & RX4_V1_AIS))
 			goto rx_normal;
 
-		reason = RX4_DMA_AI_GET(rxinfo4);
-	} else if (priv->ppe_rx_format == RA_PPE_RX_V2) {
-		reason = FIELD_GET(RX4_V2_PPE_CPU_REASON, rxinfo4);
+		reason = RX4_V1_AI_GET(rxinfo4);
+		foe = RX4_V1_FOE_GET(rxinfo4);
 	} else {
-		goto rx_normal;
+		reason = RX4_V2_REASON_GET(rxinfo4);
+		foe = RX4_V2_FOE_GET(rxinfo4);
 	}
-	foe = RX4_DMA_FOE_GET(rxinfo4);
 
 	if (reason == priv->ppe_reason_unbind_rate) {
 		if (ra_ppe_offload_check(priv->ppe, foe, false)) {
@@ -1870,7 +1899,6 @@ static void ralink_fe_cdm_init(struct ralink_fe_priv *priv)
 	 * FIXME: RX ring 1 steering is currently fixed to source port 0.
 	 * This should eventually follow the board/switch topology.
 	 */
-
 	if (priv->soc == &mt7620_data && priv->rxqs > 1)
 		val |= CDM_CSG_CFG_SP_RING(0);
 
@@ -2279,9 +2307,6 @@ err_dim:
 	net_dim_free_irq_moder(priv->ndev);
 	rtnl_unlock();
 
-err_dsa_meta:
-	ralink_fe_dsa_metadata_cleanup(priv);
-
 err_pp:
 	ralink_fe_cleanup_page_pools(priv);
 
@@ -2308,7 +2333,6 @@ static void ralink_fe_remove(struct platform_device *pdev)
 		ra_ppe_deinit(priv->ppe);
 
 	ralink_fe_phylink_cleanup(priv);
-	ralink_fe_dsa_metadata_cleanup(priv);
 	ralink_fe_cleanup_page_pools(priv);
 	ralink_fe_napi_cleanup(priv);
 	ralink_fe_hw_cleanup(priv);
@@ -2500,6 +2524,7 @@ static const struct ralink_fe_soc_data rt5350_data = {
 	.txqs = 4,
 	.rxqs = 2,
 
+	.rx4_sp_valid = true,
 	.tx4_port = RA_TX4_NONE,
 
 	/* RT5350 SDM:
@@ -2524,11 +2549,14 @@ static const struct ralink_fe_soc_data mt7620_data = {
 	.pdma_sched_regs = &pdmav2_sched_regs,
 	.cdm_regs   = &mt7620_cdm_regs,
 	.gdma1_regs = &mt7620_gdma_regs,
+	.gdma2_regs = &mt7620_gdma2_regs,
 
 	.txqs = 4,
 	.rxqs = 2,
 
-	.dsa_use_oob = true,
+	.rx4_v2 = true,
+	.rx4_sp_valid = true,
+
 	.tx4_port = RA_TX4_FP,
 	/* MT7620 GDM: enable checksum verification */
 	.rx_csum_ctrl = 0x0600,
@@ -2557,6 +2585,7 @@ static const struct ralink_fe_soc_data mt76x8_data = {
 	.txqs = 4,
 	.rxqs = 2,
 
+	.rx4_sp_valid = true,
 	.tx4_port = RA_TX4_NONE,
 	/* MT76x8 SDM:
 	 * clear drop-on-checksum-error bits so errors are reported in RXD.

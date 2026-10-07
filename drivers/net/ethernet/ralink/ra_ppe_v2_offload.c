@@ -247,8 +247,10 @@ ra_ppe_v2_resolve_output(struct ra_ppe *ppe,
 			 const struct ra_flow_data *data,
 			 struct ra_ppe_v2_output *out)
 {
+#if IS_ENABLED(CONFIG_NET_DSA)
 	struct dsa_port *dp;
 	struct net_device *br;
+#endif
 
 	if (data->vlan.push &&
 	    data->vlan.push_proto != htons(ETH_P_8021Q)) {
@@ -257,73 +259,78 @@ ra_ppe_v2_resolve_output(struct ra_ppe *ppe,
 		return -EOPNOTSUPP;
 	}
 
+#if IS_ENABLED(CONFIG_NET_DSA)
 	dp = dsa_port_from_netdev(data->out_dev);
-	if (IS_ERR(dp)) {
-		if (data->out_dev != ppe->fe->ndev)
+	if (!IS_ERR(dp)) {
+		if (!dp->cpu_dp || !dp->cpu_dp->tag_ops ||
+		    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_RALINK_8021Q)
 			return -EOPNOTSUPP;
 
-		out->fpidx = RA_PPE_V2_FPIDX_LOOKUP;
+		if (dp->index > 5)
+			return -EOPNOTSUPP;
 
-		if (data->vlan.push) {
-			out->vlan1 = ra_ppe_v2_vlan_tci(
-					data->vlan.push_vid,
-					data->vlan.push_prio);
+		out->fpidx = dp->index;
+
+		br = dsa_port_bridge_dev_get(dp);
+
+		if (br && br_vlan_enabled(br)) {
+			u16 pvid;
+			int err;
+
+			if (data->vlan.push) {
+				out->vlan1 = ra_ppe_v2_vlan_tci(
+						data->vlan.push_vid,
+						data->vlan.push_prio);
+				out->vlan_layers = 1;
+				goto pppoe;
+			}
+
+			if (data->vlan.pop)
+				goto pppoe;
+
+			rcu_read_lock();
+			err = br_vlan_get_pvid_rcu(br, &pvid);
+			rcu_read_unlock();
+			if (err)
+				return err;
+
+			out->vlan1 = pvid;
 			out->vlan_layers = 1;
-		}
 
-		goto pppoe;
-	}
-
-	if (!dp->cpu_dp || !dp->cpu_dp->tag_ops ||
-	    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_RALINK)
-		return -EOPNOTSUPP;
-
-	if (dp->index > 5)
-		return -EOPNOTSUPP;
-
-	out->fpidx = dp->index;
-
-	br = dsa_port_bridge_dev_get(dp);
-
-	if (br && br_vlan_enabled(br)) {
-		u16 pvid;
-		int err;
-
-		if (data->vlan.push) {
-			out->vlan1 = ra_ppe_v2_vlan_tci(
-					data->vlan.push_vid,
-					data->vlan.push_prio);
-			out->vlan_layers = 1;
 			goto pppoe;
 		}
 
-		if (data->vlan.pop)
+		if (br) {
+			unsigned int bridge_num;
+
+			bridge_num = dsa_port_bridge_num_get(dp);
+
+			out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
+			out->vlan_layers = 1;
+
 			goto pppoe;
+		}
 
-		rcu_read_lock();
-		err = br_vlan_get_pvid_rcu(br, &pvid);
-		rcu_read_unlock();
-		if (err)
-			return err;
-
-		out->vlan1 = pvid;
-		out->vlan_layers = 1;
-		goto pppoe;
-	}
-
-	if (br) {
-		unsigned int bridge_num;
-
-		bridge_num = dsa_port_bridge_num_get(dp);
-
-		out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
+		out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
 		out->vlan_layers = 1;
 
 		goto pppoe;
 	}
+#endif
 
-	out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
-	out->vlan_layers = 1;
+	/*
+	 * Non-DSA output must be the FE netdev itself.
+	 */
+	if (data->out_dev != ppe->fe->ndev)
+		return -EOPNOTSUPP;
+
+	out->fpidx = RA_PPE_V2_FPIDX_LOOKUP;
+
+	if (data->vlan.push) {
+		out->vlan1 = ra_ppe_v2_vlan_tci(data->vlan.push_vid,
+						data->vlan.push_prio);
+		out->vlan_layers = 1;
+	}
 
 pppoe:
 	if (data->pppoe.push) {

@@ -38,6 +38,7 @@ struct ra_ppe {
 	void __iomem *base;
 
 	const struct ra_ppe_ops *ops;
+	bool ralink_dsa;
 
 	void *foe_table;
 	dma_addr_t foe_phys;

@@ -230,31 +230,44 @@ struct ralink_fe_rx_desc {
 #define RX2_DMA_SDL0_GET(_x)	FIELD_GET(RX2_DMA_SDL0_MASK, (_x))
 
 /*
- * RX4_DMA_L4FVLD means the L4 checksum result is valid for this packet
- * (IPv4, no fragments, TCP/UDP). RX4_DMA_L4F indicates checksum failure.
+ * RX4_V1_L4FVLD means the L4 checksum result is valid for this packet
+ * (IPv4, no fragments, TCP/UDP). RX4_V1_L4F indicates checksum failure.
  */
-#define RX4_DMA_IPFVLD		BIT(31)
-#define RX4_DMA_L4FVLD		BIT(30)
-#define RX4_DMA_IPF		BIT(29)
-#define RX4_DMA_L4F		BIT(28)
-#define RX4_DMA_AIS		BIT(27)
-#define RX4_DMA_SP_MASK		GENMASK(26, 24)
-#define RX4_DMA_AI_MASK		GENMASK(23, 16)
-#define RX4_DMA_FVLD		BIT(14)
-#define RX4_DMA_FOE_ENTRY	GENMASK(13, 0)
+#define RX4_V1_IPFVLD		BIT(31)
+#define RX4_V1_L4FVLD		BIT(30)
+#define RX4_V1_IPF		BIT(29)
+#define RX4_V1_L4F		BIT(28)
+#define RX4_V1_AIS		BIT(27)
+#define RX4_V1_SP_MASK		GENMASK(26, 24)
+#define RX4_V1_AI_MASK		GENMASK(23, 16)
+#define RX4_V1_FVLD		BIT(14)
+#define RX4_V1_FOE_ENTRY	GENMASK(13, 0)
 
-#define RX4_DMA_SP_GET(_x)	FIELD_GET(RX4_DMA_SP_MASK, (_x))
-#define RX4_DMA_AI_GET(_x)	FIELD_GET(RX4_DMA_AI_MASK, (_x))
-#define RX4_DMA_FOE_GET(_x)	FIELD_GET(RX4_DMA_FOE_ENTRY, (_x))
+#define RX4_V1_SP_GET(_x)	FIELD_GET(RX4_V1_SP_MASK, (_x))
+#define RX4_V1_AI_GET(_x)	FIELD_GET(RX4_V1_AI_MASK, (_x))
+#define RX4_V1_FOE_GET(_x)	FIELD_GET(RX4_V1_FOE_ENTRY, (_x))
 
+
+#define RX4_V2_PKT_INFO		GENMASK(27, 22)
+#define RX4_V2_PKT_IPV6		BIT(27)
+#define RX4_V2_PKT_IPV4		BIT(26)
+#define RX4_V2_PKT_IP_ERR	BIT(25)
+#define RX4_V2_PKT_TCP_ACK	BIT(24)
+#define RX4_V2_PKT_L4_VALID	BIT(23)
+#define RX4_V2_PKT_L4_ERR	BIT(22)
+/*
+ * When SP == 6, bits 26:22 may instead carry the user-defined field.
+ */
+#define RX4_V2_UDF		GENMASK(26, 22)
+#define RX4_V2_SP		GENMASK(21, 19)
 #define RX4_V2_PPE_CPU_REASON	GENMASK(18, 14)
+#define RX4_V2_PPE_ENTRY	GENMASK(13, 0)
 
-#define MT7620_RX4_PKT_INFO	GENMASK(27, 22)
-#define MT7620_RX4_PKT_L4_ERR	BIT(22)
-#define MT7620_RX4_PKT_L4_VALID	BIT(23)
-#define MT7620_RX4_PKT_IP_ERR	BIT(25)
-#define MT7620_RX4_SP_MASK	GENMASK(21, 19)
-#define MT7620_DMA_SP_GET(_x)	FIELD_GET(MT7620_RX4_SP_MASK, (_x))
+#define RX4_V2_PPE_ENTRY_INVALID	0x3fff
+
+#define RX4_V2_SP_GET(_x)	FIELD_GET(RX4_V2_SP, (_x))
+#define RX4_V2_REASON_GET(_x)	FIELD_GET(RX4_V2_PPE_CPU_REASON, (_x))
+#define RX4_V2_FOE_GET(_x)	FIELD_GET(RX4_V2_PPE_ENTRY, (_x))
 
 
 /* ---- private ---- */
@@ -341,7 +354,8 @@ struct ralink_fe_soc_data {
 	u8			txqs;
 	u8			rxqs;
 
-	bool			dsa_use_oob;
+	bool			rx4_v2;
+	bool			rx4_sp_valid;
 	u32			tx4_port;
 
 	u32			rx_csum_ctrl;
@@ -411,8 +425,8 @@ struct ralink_fe_priv {
 	struct ra_ppe			*ppe;
 	u8				ppe_reason_unbind_rate;
 	u8				ppe_reason_keepalive;
-	enum ra_ppe_rx_format		ppe_rx_format;
-	bool				dsa_use_oob;
+	bool				rx4_v2;
+	bool				rx4_sp_valid;
 
 	const struct ralink_fe_soc_data	*soc;
 

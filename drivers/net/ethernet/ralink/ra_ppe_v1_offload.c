@@ -189,8 +189,10 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 			 const struct ra_flow_data *data,
 			 struct ra_ppe_v1_output *out)
 {
+#if IS_ENABLED(CONFIG_NET_DSA)
 	struct dsa_port *dp;
 	struct net_device *br;
+#endif
 
 	/*
 	 * PPEv1 supports only 802.1Q VLAN insertion in this path.
@@ -202,89 +204,90 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 		return -EOPNOTSUPP;
 	}
 
+#if IS_ENABLED(CONFIG_NET_DSA)
 	dp = dsa_port_from_netdev(data->out_dev);
-	if (IS_ERR(dp)) {
-		if (data->out_dev != ppe->fe->ndev)
+	if (!IS_ERR(dp)) {
+		if (!dp->cpu_dp || !dp->cpu_dp->tag_ops ||
+		    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_RALINK_8021Q)
 			return -EOPNOTSUPP;
 
-		out->dp = 1;
+		br = dsa_port_bridge_dev_get(dp);
 
-		/*
-		 * Non-DSA output. Translate logical flower VLAN operations
-		 * directly into PPEv1 smart-VLAN semantics.
-		 */
-		if (data->vlan.pop && data->vlan.push) {
-			out->vlan1 = data->vlan.push_vid;
-			out->vlan1_action = RA_PPE_V1_ACT_MODIFY;
-		} else if (data->vlan.push) {
-			out->vlan1 = data->vlan.push_vid;
-			out->vlan1_action = RA_PPE_V1_ACT_INSERT;
-		} else if (data->vlan.pop) {
-			out->vlan1_action = RA_PPE_V1_ACT_DELETE;
-		} else {
-			out->vlan1_action = RA_PPE_V1_ACT_NONE;
-		}
+		if (br && br_vlan_enabled(br)) {
+			u16 pvid;
+			int err;
 
-		goto pppoe;
-	}
+			out->dp = 1;
 
-	if (!dp->cpu_dp || !dp->cpu_dp->tag_ops ||
-	    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_RALINK)
-		return -EOPNOTSUPP;
+			if (data->vlan.push) {
+				out->vlan1 = data->vlan.push_vid;
+				out->vlan1_action = data->vlan.pop ?
+						    RA_PPE_V1_ACT_MODIFY :
+						    RA_PPE_V1_ACT_INSERT;
 
-	br = dsa_port_bridge_dev_get(dp);
+				out->vlan2_action = RA_PPE_V1_ACT_DELETE;
+				goto pppoe;
+			}
 
-	if (br && br_vlan_enabled(br)) {
-		u16 pvid;
-		int err;
+			rcu_read_lock();
+			err = br_vlan_get_pvid_rcu(br, &pvid);
+			rcu_read_unlock();
+			if (err)
+				return err;
 
-		out->dp = 1;
-
-		if (data->vlan.push) {
-			out->vlan1 = data->vlan.push_vid;
+			out->vlan1 = pvid;
 			out->vlan1_action = data->vlan.pop ?
-					    RA_PPE_V1_ACT_MODIFY :
+					    RA_PPE_V1_ACT_DELETE :
 					    RA_PPE_V1_ACT_INSERT;
 
-			out->vlan2_action = RA_PPE_V1_ACT_DELETE;
 			goto pppoe;
 		}
 
-		rcu_read_lock();
-		err = br_vlan_get_pvid_rcu(br, &pvid);
-		rcu_read_unlock();
-		if (err)
-			return err;
+		if (br) {
+			unsigned int bridge_num;
 
-		out->vlan1 = pvid;
-		out->vlan1_action = data->vlan.pop ?
-				    RA_PPE_V1_ACT_DELETE :
-				    RA_PPE_V1_ACT_INSERT;
+			bridge_num = dsa_port_bridge_num_get(dp);
 
-		goto pppoe;
-	}
+			out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
+			out->vlan1_action = RA_PPE_V1_ACT_INSERT;
+			out->dp = 1;
 
-	if (br) {
-		unsigned int bridge_num;
+			goto pppoe;
+		}
 
-		bridge_num = dsa_port_bridge_num_get(dp);
-
-		out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
+		out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
 		out->vlan1_action = RA_PPE_V1_ACT_INSERT;
-		out->dp = 1;
+		out->dp = 2;
 
 		goto pppoe;
 	}
+#endif
 
-	out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
-	out->vlan1_action = RA_PPE_V1_ACT_INSERT;
-	out->dp = 2;
+	/*
+	 * Non-DSA output must be the FE netdev itself.
+	 */
+	if (data->out_dev != ppe->fe->ndev)
+		return -EOPNOTSUPP;
+
+	out->dp = 1;
+
+	/*
+	 * Translate logical flower VLAN operations directly into
+	 * PPEv1 smart-VLAN semantics.
+	 */
+	if (data->vlan.pop && data->vlan.push) {
+		out->vlan1 = data->vlan.push_vid;
+		out->vlan1_action = RA_PPE_V1_ACT_MODIFY;
+	} else if (data->vlan.push) {
+		out->vlan1 = data->vlan.push_vid;
+		out->vlan1_action = RA_PPE_V1_ACT_INSERT;
+	} else if (data->vlan.pop) {
+		out->vlan1_action = RA_PPE_V1_ACT_DELETE;
+	} else {
+		out->vlan1_action = RA_PPE_V1_ACT_NONE;
+	}
 
 pppoe:
-	/*
-	 * Keep PPPoE translation PPEv1-local. The generic flow only
-	 * describes the logical PPPOE_PUSH action requested by Linux.
-	 */
 	if (data->pppoe.push) {
 		out->pppoe = true;
 		out->pppoe_id = data->pppoe.sid;
