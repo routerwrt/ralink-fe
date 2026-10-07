@@ -328,14 +328,9 @@ struct ralink_sdm_regs {
 	u32 tring;
 };
 
-enum ra_ppe_rx_format {
-	RA_PPE_RX_V1,
-	RA_PPE_RX_V2,
-};
-
 struct ra_ppe_match_data {
 	const struct ra_ppe_ops *ops;
-	enum ra_ppe_rx_format rx_format;
+	const char *name;
 };
 
 struct ralink_fe_soc_data {

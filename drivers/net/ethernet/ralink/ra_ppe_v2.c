@@ -33,6 +33,7 @@
 #define RA_PPE_V2_TCP_TIMEOUT		5
 #define RA_PPE_V2_UDP_TIMEOUT		5
 #define RA_PPE_V2_FIN_TIMEOUT		5
+#define RA_PPE_V2_NTU_TIMEOUT		5
 
 /*
  * Keep the same conservative occupancy policy as PPEv1.
@@ -76,22 +77,20 @@ ra_ppe_v2_get_foe_config(u32 entries, struct ra_ppe_v2_foe_config *cfg)
 
 static void ra_ppe_v2_clear_table(struct ra_ppe *ppe)
 {
-	size_t size;
-
-	size = (size_t)ppe->foe_entries * ppe->foe_entry_size;
+	size_t size = (size_t)ppe->foe_entries * ppe->foe_entry_size;
 
 	memset(ppe->foe_table, 0, size);
-
-	/*
-	 * Coherent DMA removes cache maintenance, not ordering.
-	 */
 	dma_wmb();
+}
+
+static void ra_ppe_v2_config_ip_prot(struct ra_ppe *ppe)
+{
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_IP_PROT_CHK, 0xffffffff);
 }
 
 static void ra_ppe_v2_set_bind_rate(struct ra_ppe *ppe, u32 pps)
 {
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_BNDR,
-		   RA_PPE_V2_BIND_RATE,
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_BNDR,
 		   FIELD_PREP(RA_PPE_V2_BIND_RATE, pps));
 }
 
@@ -103,8 +102,7 @@ ra_ppe_v2_set_entry_limits(struct ra_ppe *ppe, u16 full,
 		   FIELD_PREP(RA_PPE_V2_BIND_LMT0_QUARTER, quarter) |
 		   FIELD_PREP(RA_PPE_V2_BIND_LMT0_HALF, half));
 
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_BIND_LMT_1,
-		   RA_PPE_V2_BIND_LMT1_FULL,
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_BIND_LMT_1,
 		   FIELD_PREP(RA_PPE_V2_BIND_LMT1_FULL, full));
 }
 
@@ -112,85 +110,40 @@ static void
 ra_ppe_v2_set_ka_interval(struct ra_ppe *ppe, u16 timer,
 			  u8 tcp, u8 udp)
 {
-	u32 mask, val;
-
-	mask = RA_PPE_V2_KA_TIMER |
-	       RA_PPE_V2_KA_TCP |
-	       RA_PPE_V2_KA_UDP;
-
-	val = FIELD_PREP(RA_PPE_V2_KA_TIMER, timer) |
-	      FIELD_PREP(RA_PPE_V2_KA_TCP, tcp) |
-	      FIELD_PREP(RA_PPE_V2_KA_UDP, udp);
-
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_KA, mask, val);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_KA,
+		   FIELD_PREP(RA_PPE_V2_KA_TIMER, timer) |
+		   FIELD_PREP(RA_PPE_V2_KA_TCP, tcp) |
+		   FIELD_PREP(RA_PPE_V2_KA_UDP, udp));
 }
 
 static void
 ra_ppe_v2_set_unbind_age(struct ra_ppe *ppe, u16 min_packets,
 			 u8 timeout)
 {
-	u32 mask, val;
-
-	mask = RA_PPE_V2_UNB_AGE_MIN_PKT |
-	       RA_PPE_V2_UNB_AGE_DELTA;
-
-	val = FIELD_PREP(RA_PPE_V2_UNB_AGE_MIN_PKT, min_packets) |
-	      FIELD_PREP(RA_PPE_V2_UNB_AGE_DELTA, timeout);
-
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_UNB_AGE, mask, val);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_UNB_AGE,
+		   FIELD_PREP(RA_PPE_V2_UNB_AGE_MIN_PKT, min_packets) |
+		   FIELD_PREP(RA_PPE_V2_UNB_AGE_DELTA, timeout));
 }
 
 static void
 ra_ppe_v2_set_bind_age(struct ra_ppe *ppe, u16 tcp_timeout,
-		       u16 udp_timeout, u16 fin_timeout)
+		       u16 udp_timeout, u16 ntu_timeout,
+		       u16 fin_timeout)
 {
-	u32 mask, val;
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_BND_AGE_0,
+		   FIELD_PREP(RA_PPE_V2_BND_AGE0_UDP, udp_timeout) |
+		   FIELD_PREP(RA_PPE_V2_BND_AGE0_NTU, ntu_timeout));
 
-	/*
-	 * Keep these helpers separate from PPEv1 even where the register
-	 * layout happens to overlap. The two generations have independent
-	 * register definitions by design.
-	 */
-	mask = RA_PPE_V2_BND_AGE0_UDP;
-	val = FIELD_PREP(RA_PPE_V2_BND_AGE0_UDP, udp_timeout);
-
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_BND_AGE_0, mask, val);
-
-	mask = RA_PPE_V2_BND_AGE1_TCP |
-	       RA_PPE_V2_BND_AGE1_FIN;
-
-	val = FIELD_PREP(RA_PPE_V2_BND_AGE1_TCP, tcp_timeout) |
-	      FIELD_PREP(RA_PPE_V2_BND_AGE1_FIN, fin_timeout);
-
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_BND_AGE_1, mask, val);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_BND_AGE_1,
+		   FIELD_PREP(RA_PPE_V2_BND_AGE1_TCP, tcp_timeout) |
+		   FIELD_PREP(RA_PPE_V2_BND_AGE1_FIN, fin_timeout));
 }
 
 static void
 ra_ppe_v2_config_table(struct ra_ppe *ppe,
 		       const struct ra_ppe_v2_foe_config *cfg)
 {
-	u32 mask, val;
-
-	/*
-	 * HNATv2 table configuration:
-	 *
-	 *   bits 2:0   table size
-	 *   bit  3     80-byte entry format
-	 *   bits 5:4   search-miss action
-	 *   bits 15:14 hash mode
-	 *
-	 * Always use 80-byte entries. This is a hardware table property,
-	 * not something conditional on CONFIG_IPV6.
-	 */
-	mask = RA_PPE_V2_TB_ENTRY_NUM |
-	       RA_PPE_V2_TB_ENTRY_SIZE |
-	       RA_PPE_V2_TB_MISS_ACTION |
-	       RA_PPE_V2_TB_UNB_AGE_EN |
-	       RA_PPE_V2_TB_TCP_AGE_EN |
-	       RA_PPE_V2_TB_UDP_AGE_EN |
-	       RA_PPE_V2_TB_FIN_AGE_EN |
-	       RA_PPE_V2_TB_KA_CFG |
-	       RA_PPE_V2_TB_HASH_MODE;
+	u32 val;
 
 	val = FIELD_PREP(RA_PPE_V2_TB_ENTRY_NUM, cfg->tbl_size) |
 	      RA_PPE_V2_TB_ENTRY_SIZE |
@@ -205,8 +158,7 @@ ra_ppe_v2_config_table(struct ra_ppe *ppe,
 	      FIELD_PREP(RA_PPE_V2_TB_HASH_MODE,
 			 RA_PPE_V2_HASH_MODE_1);
 
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_TB_CFG, mask, val);
-
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_TB_CFG, val);
 	ra_ppe_w32(ppe, RA_V2_REG_PPE_HASH_SEED,
 		   RA_PPE_V2_HASH_SEED);
 }
@@ -233,34 +185,85 @@ static void ra_ppe_v2_config_flow(struct ra_ppe *ppe)
 	ra_ppe_m32(ppe, RA_V2_REG_PPE_FLOW_CFG, mask, val);
 }
 
-static void ra_ppe_v2_disable_flows(struct ra_ppe *ppe)
+static void ra_ppe_v2_config_fp_bmap(struct ra_ppe *ppe)
 {
-	u32 mask;
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FP_BMAP_0, 0x00020001);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FP_BMAP_1, 0x00080004);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FP_BMAP_2, 0x00200010);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FP_BMAP_3, 0x00800040);
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FP_BMAP_4, 0x003f0000);
+}
 
-	mask = RA_PPE_V2_FBC_FOE |
-	       RA_PPE_V2_FMC_FOE |
-	       RA_PPE_V2_FUC_FOE |
-	       RA_PPE_V2_IPV6_3T_ROUTE_EN |
-	       RA_PPE_V2_IPV6_5T_ROUTE_EN |
-	       RA_PPE_V2_IPV6_6RD_EN |
-	       RA_PPE_V2_IPV4_NAT_EN |
-	       RA_PPE_V2_IPV4_NAPT_EN |
-	       RA_PPE_V2_IPV4_DSLITE_EN;
+void ra_ppe_v2_cache_clear(struct ra_ppe *ppe)
+{
+	ra_ppe_m32(ppe, RA_V2_REG_PPE_CAH_CTRL,
+		   RA_PPE_V2_CAH_CTRL_CLEAR,
+		   RA_PPE_V2_CAH_CTRL_CLEAR);
 
-	ra_ppe_m32(ppe, RA_V2_REG_PPE_FLOW_CFG, mask, 0);
+	ra_ppe_m32(ppe, RA_V2_REG_PPE_CAH_CTRL,
+		   RA_PPE_V2_CAH_CTRL_CLEAR, 0);
+}
+
+static void ra_ppe_v2_config_cache(struct ra_ppe *ppe, bool enable)
+{
+	u32 val;
+
+	ra_ppe_v2_cache_clear(ppe);
+
+	val = ra_ppe_r32(ppe, RA_V2_REG_PPE_CAH_CTRL);
+
+	if (enable)
+		val |= RA_PPE_V2_CAH_CTRL_EN;
+	else
+		val &= ~RA_PPE_V2_CAH_CTRL_EN;
+
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_CAH_CTRL, val);
 }
 
 static void ra_ppe_v2_config_global(struct ra_ppe *ppe)
 {
 	/*
-	 * MT7620 vendor code does not use PPE_GLO_CFG bit 0 as an engine
-	 * enable. Do not import the PPEv1 RA_PPE_GLO_EN interpretation.
-	 *
-	 * TTL0_DROP remains clear so exceptional TTL packets are returned
-	 * toward the CPU path rather than silently discarded.
+	 * MT7620 reference configuration does not set GLO_CFG.EN.
+	 * TTL=0 packets are returned to CPU.
 	 */
 	ra_ppe_m32(ppe, RA_V2_REG_PPE_GLO_CFG,
 		   RA_PPE_V2_TTL0_DROP, 0);
+}
+
+static void ra_ppe_v2_config_mt7620_fe(struct ra_ppe *ppe)
+{
+	u32 val;
+
+	val = ra_ppe_r32(ppe, 0x0d00);
+	val &= ~0x7777;
+	ra_ppe_w32(ppe, 0x0d00, val);
+}
+
+static void ra_ppe_v2_enable_flows(struct ra_ppe *ppe)
+{
+	u32 val;
+
+	val = RA_PPE_V2_FBC_FOE |
+	      RA_PPE_V2_FMC_FOE |
+	      RA_PPE_V2_FUC_FOE |
+	      RA_PPE_V2_IPV6_3T_ROUTE_EN |
+	      RA_PPE_V2_IPV6_5T_ROUTE_EN |
+	      RA_PPE_V2_IPV6_6RD_EN |
+	      RA_PPE_V2_IPV4_NAT_EN |
+	      RA_PPE_V2_IPV4_NAPT_EN |
+	      RA_PPE_V2_IPV4_DSLITE_EN;
+
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FLOW_CFG, val);
+
+}
+
+static void ra_ppe_v2_disable_flows(struct ra_ppe *ppe)
+{
+	/*
+	 * PPE is quiescent here. Use a full write so bootloader state
+	 * cannot leave unrelated flow modes enabled.
+	 */
+	ra_ppe_w32(ppe, RA_V2_REG_PPE_FLOW_CFG, 0);
 }
 
 static int ra_ppe_v2_hw_init(struct ra_ppe *ppe)
@@ -279,22 +282,16 @@ static int ra_ppe_v2_hw_init(struct ra_ppe *ppe)
 	if (WARN_ON_ONCE(upper_32_bits((u64)ppe->foe_phys)))
 		return -ERANGE;
 
-	/*
-	 * Start from a quiescent PPE configuration. GSW steering should not
-	 * yet be active, but also make bootloader leftovers harmless.
-	 */
+	/* Nothing may enter PPE while its global state is incomplete. */
 	ra_ppe_v2_disable_flows(ppe);
-
-	/*
-	 * Publish no usable descriptor state before the complete table has
-	 * been initialized.
-	 */
-	ra_ppe_v2_clear_table(ppe);
 
 	ra_ppe_w32(ppe, RA_V2_REG_PPE_TB_BASE,
 		   lower_32_bits(ppe->foe_phys));
 
+	ra_ppe_v2_clear_table(ppe);
 	ra_ppe_v2_config_table(ppe, &cfg);
+
+	ra_ppe_v2_config_ip_prot(ppe);
 
 	ra_ppe_v2_set_bind_rate(ppe, RA_PPE_V2_BIND_RATE_PPS);
 
@@ -315,16 +312,18 @@ static int ra_ppe_v2_hw_init(struct ra_ppe *ppe)
 	ra_ppe_v2_set_bind_age(ppe,
 			       RA_PPE_V2_TCP_TIMEOUT,
 			       RA_PPE_V2_UDP_TIMEOUT,
+			       RA_PPE_V2_NTU_TIMEOUT,
 			       RA_PPE_V2_FIN_TIMEOUT);
 
+	ra_ppe_v2_config_fp_bmap(ppe);
+
+	/* Preserve the known-working bring-up configuration. */
+	ra_ppe_v2_config_cache(ppe, false);
+	ra_ppe_v2_config_mt7620_fe(ppe);
 	ra_ppe_v2_config_global(ppe);
 
-	/*
-	 * FLOW_CFG is programmed last on the PPE side. Once GSW steering is
-	 * subsequently enabled, hardware may immediately start constructing
-	 * UNBIND entries.
-	 */
-	ra_ppe_v2_config_flow(ppe);
+	/* Enable packet processing last. */
+	ra_ppe_v2_enable_flows(ppe);
 
 	dma_wmb();
 
@@ -367,5 +366,5 @@ const struct ra_ppe_ops ra_ppe_v2_ops = {
 		RA_PPE_V2_REASON_HIT_UNBIND_RATE_REACH,
 
 	.cpu_reason_keepalive	=
-		RA_PPE_V2_REASON_HIT_BIND_KA_UC_OLD_HDR,
+		RA_PPE_V2_REASON_HIT_BIND_KA_DUP_OLD_HDR,
 };

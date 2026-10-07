@@ -2144,11 +2144,13 @@ static void ralink_fe_hw_cleanup(struct ralink_fe_priv *priv)
 }
 
 static const struct ra_ppe_match_data ra_ppe_v1_data = {
-	.ops = RA_PPE_V1_OPS, .rx_format = RA_PPE_RX_V1,
+	.ops = RA_PPE_V1_OPS,
+	.name = "PPEv1",
 };
 
 static const struct ra_ppe_match_data ra_ppe_v2_data = {
-	.ops = RA_PPE_V2_OPS, .rx_format = RA_PPE_RX_V2,
+	.ops = RA_PPE_V2_OPS,
+	.name = "PPEv2",
 };
 
 static const struct of_device_id ralink_ppe_of_match[] = {
@@ -2180,6 +2182,7 @@ static int ralink_fe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	const struct ralink_fe_soc_data *soc;
+	const struct ra_ppe_match_data *data;
 	struct device_node *ppe_np;
 	const struct of_device_id *ppe_match;
 	const struct ralink_fe_reg_map *pdma;
@@ -2276,9 +2279,7 @@ static int ralink_fe_probe(struct platform_device *pdev)
 
 	ppe_match = ralink_fe_get_ppe_match(priv, &ppe_np);
 	if (ppe_match) {
-		const struct ra_ppe_match_data *data = ppe_match->data;
-
-		priv->ppe_rx_format = data->rx_format;
+		data = ppe_match->data;
 
 		err = ralink_fe_ppe_init(priv, data->ops);
 		of_node_put(ppe_np);
@@ -2445,8 +2446,8 @@ static const struct ralink_fe_soc_data rt2880_data = {
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
 	/* BC / MC /UC to CPU */
 	.rx_csum_ctrl_clear = 0xffff,
-	.rx_csum_valid = RX4_DMA_L4FVLD,
-	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+	.rx_csum_valid = RX4_V1_L4FVLD,
+	.rx_csum_clear = RX4_V1_L4F | RX4_V1_IPF,
 
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
@@ -2474,8 +2475,8 @@ static const struct ralink_fe_soc_data rt305x_data = {
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
 	/* BC / MC /UC to CPU */
 	.rx_csum_ctrl_clear = 0xffff,
-	.rx_csum_valid = RX4_DMA_L4FVLD,
-	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+	.rx_csum_valid = RX4_V1_L4FVLD,
+	.rx_csum_clear = RX4_V1_L4F | RX4_V1_IPF,
 
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
@@ -2503,8 +2504,8 @@ static const struct ralink_fe_soc_data rt3883_data = {
 	.rx_csum_ctrl_set = GDM_ICS_EN | GDM_TCS_EN | GDM_UCS_EN,
 	/* BC / MC /UC to CPU */
 	.rx_csum_ctrl_clear = 0xffff,
-	.rx_csum_valid = RX4_DMA_L4FVLD,
-	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+	.rx_csum_valid = RX4_V1_L4FVLD,
+	.rx_csum_clear = RX4_V1_L4F | RX4_V1_IPF,
 
 	.mac_adr_l = 0x002c,
 	.mac_adr_h = 0x0030,
@@ -2533,8 +2534,8 @@ static const struct ralink_fe_soc_data rt5350_data = {
 	.rx_csum_ctrl = 0x0c00,
 	.rx_csum_ctrl_set = 0,
 	.rx_csum_ctrl_clear = SDM_IPCS | SDM_TCPCS | SDM_UDPCS,
-	.rx_csum_valid = RX4_DMA_L4FVLD,
-	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+	.rx_csum_valid = RX4_V1_L4FVLD,
+	.rx_csum_clear = RX4_V1_L4F | RX4_V1_IPF,
 
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,
@@ -2564,8 +2565,8 @@ static const struct ralink_fe_soc_data mt7620_data = {
 	/* MT7620 GDM forward to CPU */
 	.rx_csum_ctrl_clear = 0x7,
 
-	.rx_csum_valid = MT7620_RX4_PKT_L4_VALID,
-	.rx_csum_clear = MT7620_RX4_PKT_L4_ERR | MT7620_RX4_PKT_IP_ERR,
+	.rx_csum_valid = RX4_V2_PKT_L4_VALID,
+	.rx_csum_clear = RX4_V2_PKT_L4_ERR | RX4_V2_PKT_IP_ERR,
 
 	.mac_adr_l = 0x13fe4,
 	.mac_adr_h = 0x13ff8,
@@ -2593,8 +2594,8 @@ static const struct ralink_fe_soc_data mt76x8_data = {
 	.rx_csum_ctrl = 0x0c00,
 	.rx_csum_ctrl_set = 0,
 	.rx_csum_ctrl_clear = SDM_IPCS | SDM_TCPCS | SDM_UDPCS,
-	.rx_csum_valid = RX4_DMA_L4FVLD,
-	.rx_csum_clear = RX4_DMA_L4F | RX4_DMA_IPF,
+	.rx_csum_valid = RX4_V1_L4FVLD,
+	.rx_csum_clear = RX4_V1_L4F | RX4_V1_IPF,
 
 	.mac_adr_l = 0x0c0c,
 	.mac_adr_h = 0x0c10,

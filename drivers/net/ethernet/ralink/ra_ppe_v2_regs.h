@@ -12,31 +12,38 @@
 
 #define RA_V2_REG_FOE_TS		0x0010
 
-#define RA_V2_REG_PPE_GLO_CFG		0x0800
-#define RA_V2_REG_PPE_FLOW_CFG		0x0804
-#define RA_V2_REG_PPE_IP_PROT_CHK	0x0808
-#define RA_V2_REG_PPE_IP_PROT_0		0x080c
-#define RA_V2_REG_PPE_IP_PROT_1		0x0810
-#define RA_V2_REG_PPE_IP_PROT_2		0x0814
-#define RA_V2_REG_PPE_IP_PROT_3		0x0818
+#define RA_V2_REG_PPE_GLO_CFG		0x0e00
+#define RA_V2_REG_PPE_FLOW_CFG		0x0e04
+#define RA_V2_REG_PPE_IP_PROT_CHK	0x0e08
+#define RA_V2_REG_PPE_IP_PROT_0		0x0e0c
+#define RA_V2_REG_PPE_IP_PROT_1		0x0e10
+#define RA_V2_REG_PPE_IP_PROT_2		0x0e14
+#define RA_V2_REG_PPE_IP_PROT_3		0x0e18
 
-#define RA_V2_REG_PPE_TB_CFG		0x081c
-#define RA_V2_REG_PPE_TB_BASE		0x0820
-#define RA_V2_REG_PPE_TB_USED		0x0824
-#define RA_V2_REG_PPE_BNDR		0x0828
-#define RA_V2_REG_PPE_BIND_LMT_0	0x082c
-#define RA_V2_REG_PPE_BIND_LMT_1	0x0830
-#define RA_V2_REG_PPE_KA		0x0834
-#define RA_V2_REG_PPE_UNB_AGE		0x0838
-#define RA_V2_REG_PPE_BND_AGE_0		0x083c
-#define RA_V2_REG_PPE_BND_AGE_1		0x0840
-#define RA_V2_REG_PPE_HASH_SEED		0x0844
+#define RA_V2_REG_PPE_TB_CFG		0x0e1c
+#define RA_V2_REG_PPE_TB_BASE		0x0e20
+#define RA_V2_REG_PPE_TB_USED		0x0e24
+#define RA_V2_REG_PPE_BNDR		0x0e28
+#define RA_V2_REG_PPE_BIND_LMT_0	0x0e2c
+#define RA_V2_REG_PPE_BIND_LMT_1	0x0e30
+#define RA_V2_REG_PPE_KA		0x0e34
+#define RA_V2_REG_PPE_UNB_AGE		0x0e38
+#define RA_V2_REG_PPE_BND_AGE_0		0x0e3c
+#define RA_V2_REG_PPE_BND_AGE_1		0x0e40
+#define RA_V2_REG_PPE_HASH_SEED		0x0e44
+
+#define RA_V2_REG_PPE_FP_BMAP_0		0x0e48
+#define RA_V2_REG_PPE_FP_BMAP_1		0x0e4c
+#define RA_V2_REG_PPE_FP_BMAP_2		0x0e50
+#define RA_V2_REG_PPE_FP_BMAP_3		0x0e54
+#define RA_V2_REG_PPE_FP_BMAP_4		0x0e58
+
+#define RA_V2_PPE_VPM_TPID		0x0f18
 
 /*
  * PPE_GLO_CFG
- *
- * Do not assign PPEv1/MT7621 engine-enable semantics to bit 0 here.
  */
+#define RA_PPE_V2_GLO_EN		BIT(0)
 #define RA_PPE_V2_TTL0_DROP		BIT(4)
 
 /*
@@ -77,6 +84,11 @@
 #define RA_PPE_V2_TB_HASH_MODE		GENMASK(15, 14)
 #define RA_PPE_V2_TB_XMODE		GENMASK(19, 18)
 
+#define RA_V2_REG_PPE_CAH_CTRL		0x0f20
+
+#define RA_PPE_V2_CAH_CTRL_EN		BIT(0)
+#define RA_PPE_V2_CAH_CTRL_CLEAR	BIT(9)
+
 enum ra_ppe_v2_tbl_size {
 	RA_PPE_V2_TBL_1K,
 	RA_PPE_V2_TBL_2K,
@@ -106,19 +118,13 @@ enum ra_ppe_v2_hash_mode {
 
 /*
  * HNATv2 keepalive mode.
- *
- * 0 = disabled
- * 1 = unicast old-header
- * 2 = multicast new-header
- * 3 = duplicate old-header
- *
  * Use unicast old-header for normal unicast flow activity tracking.
  * Multicast keepalive is outside the current driver scope.
  */
 enum ra_ppe_v2_ka_mode {
 	RA_PPE_V2_KA_DISABLE		= 0,
-	RA_PPE_V2_KA_UC_OLD_HDR	= 1,
-	RA_PPE_V2_KA_MC_NEW_HDR	= 2,
+	RA_PPE_V2_KA_UC_OLD_HDR		= 1,
+	RA_PPE_V2_KA_MC_NEW_HDR		= 2,
 	RA_PPE_V2_KA_DUP_OLD_HDR	= 3,
 };
 
@@ -194,7 +200,10 @@ enum ra_ppe_v2_cpu_reason {
 	RA_PPE_V2_REASON_HIT_BIND_FORCE_TO_CPU		= 0x16,
 	RA_PPE_V2_REASON_HIT_BIND_OPTION_HEADER		= 0x17,
 	RA_PPE_V2_REASON_HIT_BIND_EXCEED_MTU		= 0x1c,
+	RA_PPE_V2_REASON_PPE_BYPASS			= 0x1e,
 	RA_PPE_V2_REASON_HIT_BIND_MULTICAST_TO_CPU	= 0x1f,
 };
+
+void ra_ppe_v2_cache_clear(struct ra_ppe *ppe);
 
 #endif

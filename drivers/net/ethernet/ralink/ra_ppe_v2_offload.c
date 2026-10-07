@@ -375,11 +375,19 @@ ra_ppe_v2_build_ib1(const struct ra_flow_data *data,
 static u32
 ra_ppe_v2_build_ib2(const struct ra_ppe_v2_output *out)
 {
+	u32 ib2;
+	u8 port_mg = 0x3f;
+	u8 port_ag = 0x3f;
+
 	/*
 	 * Only the force-port index is required for the basic routed
 	 * offload path. QoS, metering and accounting remain disabled.
 	 */
-	return FIELD_PREP(RA_PPE_V2_IB2_FPIDX, out->fpidx);
+	ib2 = FIELD_PREP(RA_PPE_V2_IB2_FPIDX, out->fpidx) |
+		FIELD_PREP(RA_PPE_V2_IB2_PORT_AG, port_ag) |
+		FIELD_PREP(RA_PPE_V2_IB2_PORT_MG, port_mg);
+
+	return ib2;
 }
 
 static void
@@ -405,6 +413,8 @@ ra_ppe_v2_build_ipv4(struct ra_ppe_v2_foe_entry *foe,
 
 	ipv4->info_blk2 = ra_ppe_v2_build_ib2(out);
 
+	ipv4->etype = ETH_P_IP;
+
 	if (out->vlan_layers) {
 		ipv4->vlan1 = out->vlan1;
 		ipv4->etype = ETH_P_8021Q;
@@ -418,8 +428,10 @@ ra_ppe_v2_build_ipv4(struct ra_ppe_v2_foe_entry *foe,
 	ra_ppe_v2_foe_set_mac(ipv4->smac_hi, ipv4->smac_lo,
 			      data->eth.h_source);
 
-	if (out->pppoe)
+	if (out->pppoe) {
+		ipv4->etype = ETH_P_PPP_SES;
 		ipv4->pppoe_id = out->pppoe_id;
+	}
 }
 
 static void
@@ -649,6 +661,8 @@ ra_ppe_v2_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	ra_ppe_v2_preserve_learned_tuple(&bind, hw_entry);
 
 	ra_ppe_v2_foe_commit_locked(ppe, foe, &bind);
+
+	ra_ppe_v2_cache_clear(ppe);
 
 	entry->hash = foe;
 	entry->hash_valid = true;
