@@ -2435,6 +2435,12 @@ static const struct ralink_gdma_regs mt7620_gdma_regs = {
 	/* no sch_cfg */
 };
 
+static const struct ralink_gdma_regs mt7620_gdma2_regs = {
+        .fwd_cfg  = 0x0d00,
+        .shpr_cfg = 0x0d04,
+        /* no sch_cfg */
+};
+
 static const struct ralink_sdm_regs sdm_v1_regs = {
 	.con	= 0x0c00,
 	.rring	= 0x0c04,
