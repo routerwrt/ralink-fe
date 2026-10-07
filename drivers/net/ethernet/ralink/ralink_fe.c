@@ -731,6 +731,15 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
 
+	/*
+	 * For now skip HW handling until plumbing is ready
+	 */
+	if (skb_vlan_tag_present(skb)) {
+		skb = __vlan_hwaccel_push_inside(skb);
+		if (!skb)
+			goto err_drop;
+	}
+
 	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
 		RALINK_FE_TX_RING_MASK;
 	if (unlikely(avail < 1)) {
@@ -810,6 +819,14 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
 
+	/*
+	 * For now skip HW handling until plumbing is ready
+	 */
+	if (skb_vlan_tag_present(skb)) {
+		skb = __vlan_hwaccel_push_inside(skb);
+		if (!skb)
+			goto err_drop;
+	}
 	/*
 	 * PDMA supports scatter-gather TX. Each descriptor carries up to
 	 * two DMA segments, so a packet may span multiple descriptors.
