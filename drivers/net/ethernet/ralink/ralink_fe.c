@@ -754,6 +754,42 @@ out:
 	return vidx;
 }
 
+static int
+ralink_fe_tx_prepare_vlan(struct ralink_fe_priv *priv, struct sk_buff **pskb,
+		  u32 *txinfo)
+{
+	struct sk_buff *skb = *pskb;
+	u8 vidx, vpri;
+	u16 vid;
+
+	if (!skb_vlan_tag_present(skb))
+		return 0;
+
+	vid = skb_vlan_tag_get_id(skb);
+	vidx = READ_ONCE(priv->vlan_idx[vid]);
+
+	if (!vidx && priv->soc->tx4_port != RA_TX4_NONE)
+		vidx = ralink_fe_vlan_cache_alloc(priv, vid);
+
+	if (vidx) {
+		vpri = skb_vlan_tag_get_prio(skb);
+
+		*txinfo |= TX4_DMA_INSV |
+			   FIELD_PREP(TX4_DMA_VPRI, vpri) |
+			   FIELD_PREP(TX4_DMA_VIDX, vidx - 1);
+
+		return 0;
+	}
+
+	skb = __vlan_hwaccel_push_inside(skb);
+	if (!skb)
+		return -ENOMEM;
+
+	*pskb = skb;
+
+	return 0;
+}
+
 static netdev_tx_t
 ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 			 struct ralink_fe_tx_ring *ring,
@@ -772,27 +808,6 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 	int pn = (q & BIT(1)) ? 2 : 1;
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
-	u8 vidx, vpri;
-
-	if (skb_vlan_tag_present(skb)) {
-		u16 vid = skb_vlan_tag_get_id(skb);
-
-		vidx = READ_ONCE(priv->vlan_idx[vid]);
-
-		if (!vidx && (priv->soc->tx4_port != RA_TX4_NONE))
-			vidx = ralink_fe_vlan_cache_alloc(priv, vid);
-
-		if (vidx) {
-			vpri = skb_vlan_tag_get_prio(skb);
-			txinfo |= TX4_DMA_INSV |
-				   FIELD_PREP(TX4_DMA_VPRI, vpri) |
-				   FIELD_PREP(TX4_DMA_VIDX, vidx - 1);
-		} else {
-			skb = __vlan_hwaccel_push_inside(skb);
-			if (!skb)
-				goto err_drop;
-		}
-	}
 
 	avail = (clean - first_desc - RALINK_FE_TX_STOP_RESERVE) &
 		RALINK_FE_TX_RING_MASK;
@@ -801,6 +816,9 @@ ralink_fe_tx_xmit_linear(struct ralink_fe_priv *priv,
 		netif_tx_stop_queue(txq);
 		return NETDEV_TX_BUSY;
 	}
+
+	if (ralink_fe_tx_prepare_vlan(priv, &skb, &txinfo))
+		goto err_drop;
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
 		txinfo |= TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
@@ -872,26 +890,6 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 	int pn = (q & BIT(1)) ? 2 : 1;
 	int qn = (q & BIT(0)) ? 3 : 2;
 	int port = skb_get_queue_mapping(skb);
-	u8 vidx, vpri;
-
-	if (skb_vlan_tag_present(skb)) {
-		u16 vid = skb_vlan_tag_get_id(skb);
-		vidx = READ_ONCE(priv->vlan_idx[vid]);
-
-		if (!vidx && (priv->soc->tx4_port != RA_TX4_NONE))
-			vidx = ralink_fe_vlan_cache_alloc(priv, vid);
-
-		if (vidx) {
-			vpri = skb_vlan_tag_get_prio(skb);
-			txinfo |= TX4_DMA_INSV |
-				   FIELD_PREP(TX4_DMA_VPRI, vpri) |
-				   FIELD_PREP(TX4_DMA_VIDX, vidx - 1);
-		} else {
-			skb = __vlan_hwaccel_push_inside(skb);
-			if (!skb)
-				goto err_drop;
-		}
-	}
 
 	/*
 	 * PDMA supports scatter-gather TX. Each descriptor carries up to
@@ -904,6 +902,9 @@ ralink_fe_tx_xmit_sg(struct ralink_fe_priv *priv,
 		netif_tx_stop_queue(txq);
 		return NETDEV_TX_BUSY;
 	}
+
+	if (ralink_fe_tx_prepare_vlan(priv, &skb, &txinfo))
+		goto err_drop;
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
 		txinfo |= TX4_DMA_ICO | TX4_DMA_UCO | TX4_DMA_TCO;
