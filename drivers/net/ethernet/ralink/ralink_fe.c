@@ -1993,6 +1993,7 @@ ralink_fe_ppe_init(struct ralink_fe_priv *priv,
 
 	priv->ndev->hw_features |= NETIF_F_HW_TC;
 	priv->ndev->features |= NETIF_F_HW_TC;
+	priv->ndev->vlan_features |= NETIF_F_HW_TC;
 
 	/*
 	 * Cache the CPU reason values used in the RX hot path rather than
@@ -2308,8 +2309,9 @@ static int ralink_fe_probe(struct platform_device *pdev)
 	if (err)
 		goto err_ppe;
 
-	dev_info(dev, "Ralink FE: %u TXQ / %u RXQ\n",
-		 priv->txqs, priv->rxqs);
+	dev_info(dev, "Ralink FE: %u TXQ / %u RXQ / %s\n",
+	 priv->txqs, priv->rxqs,
+	 priv->ppe ? data->name : "PPE disabled");
 
 	return 0;
 
