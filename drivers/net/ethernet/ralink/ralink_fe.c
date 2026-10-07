@@ -718,7 +718,7 @@ ralink_fe_vlan_id_write_locked(struct ralink_fe_priv *priv, u8 idx, u16 vid)
 	u32 reg, shift, val;
 
 	reg = priv->soc->vlan_id_base + (idx >> 1) * 4;
-	shift = (idx & 1) ? 0 : 16;
+	shift = (idx & 1) ? 16 : 0;
 
 	val = ralink_fe_r32(priv, reg);
 	val &= ~(VLAN_VID_MASK << shift);
