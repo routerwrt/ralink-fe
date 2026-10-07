@@ -12,6 +12,8 @@ config NET_RALINK
 	tristate "Ralink SoC Frame Engine"
 	depends on NET_DSA || !NET_DSA
 	select PAGE_POOL
+	select PHYLINK
+	select DIMLIB
 	help
 	  This driver supports the frame engine in the Ralink RT2880,
 	  RT305x / RT3883 / RT5350 and Mediatek MT7620 and MT76x8 SoC family.
