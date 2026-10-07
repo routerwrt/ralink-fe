@@ -25,4 +25,14 @@ config RALINK_FE_PPE
 	help
 	  Enable hardware flow offload support using the Ralink PPE.
 
+config RALINK_FE_PPE_V1
+	bool
+	depends on RALINK_FE_PPE
+	default y if SOC_RT288X || SOC_RT305X || SOC_RT3883
+
+config RALINK_FE_PPE_V2
+	bool
+	depends on RALINK_FE_PPE
+	default y if SOC_MT7620
+
 endif # NET_VENDOR_RALINK
