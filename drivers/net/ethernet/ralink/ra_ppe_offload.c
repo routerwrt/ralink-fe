@@ -726,17 +726,53 @@ ra_ppe_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 	return ra_ppe_setup_tc_cls_flower(ppe, type_data);
 }
 
-int
-ra_ppe_setup_tc_block(struct ra_ppe *ppe, struct net_device *dev,
-		      struct flow_block_offload *f)
+int ra_ppe_setup_tc_block(struct ra_ppe *ppe, struct net_device *dev,
+			  struct flow_block_offload *f)
 {
+	struct flow_block_cb *block_cb;
+	flow_setup_cb_t *cb = ra_ppe_setup_tc_block_cb;
+
 	if (!ppe || !ppe->ops || !ppe->ops->offload)
 		return -EOPNOTSUPP;
 
-	return flow_block_cb_setup_simple(f,
-					  &ppe->flow_block_cb_list,
-					  ra_ppe_setup_tc_block_cb,
-					  dev, ppe, true);
+	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+		return -EOPNOTSUPP;
+
+	f->driver_block_list = &ppe->flow_block_cb_list;
+
+	switch (f->command) {
+	case FLOW_BLOCK_BIND:
+		block_cb = flow_block_cb_lookup(f->block, cb, dev);
+		if (block_cb) {
+			flow_block_cb_incref(block_cb);
+			return 0;
+		}
+
+		block_cb = flow_block_cb_alloc(cb, dev, ppe, NULL);
+		if (IS_ERR(block_cb))
+			return PTR_ERR(block_cb);
+
+		flow_block_cb_incref(block_cb);
+		flow_block_cb_add(block_cb, f);
+		list_add_tail(&block_cb->driver_list,
+			      &ppe->flow_block_cb_list);
+		return 0;
+
+	case FLOW_BLOCK_UNBIND:
+		block_cb = flow_block_cb_lookup(f->block, cb, dev);
+		if (!block_cb)
+			return -ENOENT;
+
+		if (!flow_block_cb_decref(block_cb)) {
+			flow_block_cb_remove(block_cb, f);
+			list_del(&block_cb->driver_list);
+		}
+
+		return 0;
+
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 int ra_ppe_offload_init(struct ra_ppe *ppe)
