@@ -2265,13 +2265,9 @@ static int ralink_fe_probe(struct platform_device *pdev)
 
 	ralink_fe_setup_netdev(ndev, priv);
 
-	err = ralink_fe_dsa_metadata_init(priv);
-	if (err)
-		goto err_pp;
-
 	err = ralink_fe_dim_init(priv);
 	if (err)
-		goto err_dsa_meta;
+		goto err_pp;
 
 	err = ralink_fe_mdio_register(priv);
 	if (err)
