@@ -242,13 +242,16 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 
 			goto pppoe;
 		}
-
+		/*
+		 * PCP 7 marks internal DSA tags for CoS spreading at FOE bind.
+		 */
 		if (br) {
 			unsigned int bridge_num;
 
 			bridge_num = dsa_port_bridge_num_get(dp);
 
 			out->vlan1 = dsa_tag_8021q_bridge_vid(bridge_num);
+			out->vlan1 |= 7 << VLAN_PRIO_SHIFT;
 			out->vlan1_action = RA_PPE_V1_ACT_INSERT;
 			out->dp = 1;
 
@@ -256,6 +259,7 @@ ra_ppe_v1_resolve_output(struct ra_ppe *ppe,
 		}
 
 		out->vlan1 = dsa_tag_8021q_standalone_vid(dp);
+		out->vlan1 |= 7 << VLAN_PRIO_SHIFT;
 		out->vlan1_action = RA_PPE_V1_ACT_INSERT;
 		out->dp = 2;
 
@@ -557,10 +561,13 @@ ra_ppe_v1_offload_check(struct ra_ppe *ppe, u16 foe, bool keepalive)
 	/*
 	 * Better flow spreading, similar to the DSA driver's TX queue
 	 * distribution. Flow offload bypasses netdev TX queue selection,
-	 * so derive a stable CoS class from the actual FOE slot.
+	 * so derive a stable CoS class from the actual FOE slot. Only
+	 * update PCP for DSA tag8021q as marked with PCP 7
 	 */
-	if (ppe->ralink_dsa) {
-		u16 pcp = (foe & 0x3) << 1;
+	if (ppe->ralink_dsa &&
+			(bind.ipv4.vlan1 & VLAN_PRIO_MASK) ==
+			(7 << VLAN_PRIO_SHIFT)) {
+		u16 pcp = (foe & 3) << 1;
 
 		bind.ipv4.vlan1 &= ~VLAN_PRIO_MASK;
 		bind.ipv4.vlan1 |= pcp << VLAN_PRIO_SHIFT;
